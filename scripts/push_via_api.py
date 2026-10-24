@@ -225,6 +225,50 @@ def bootstrap_if_empty(client: Client, owner: str, repo: str) -> bool:
     return True
 
 
+def remote_state(client: Client, owner: str, repo: str) -> tuple[str, set[str], set[str]]:
+    """读出远端已有状态，用于增量推送。
+
+    @return (远端 HEAD sha 或空串, 已有 commit sha 集合, 已有 blob sha 集合)
+
+    ## 为什么要这一层
+
+    全量重建对 3 个提交还行，但每改一次代码就重传七八十个 blob，
+    迭代几次就慢得没法用。这里用 `trees?recursive=1` 一次拿到远端
+    全部 blob sha，只上传本地新增的那些 —— 新增通常只有几个文件。
+    """
+    status, body = client.request(
+        'GET', '/repos/%s/%s/git/ref/heads/%s' % (owner, repo, BRANCH), raw=True)
+    if status != 200:
+        return '', set(), set()
+
+    head = (body.get('object') or {}).get('sha', '')
+    if not head:
+        return '', set(), set()
+
+    # 沿着 parent 往上走，收集已有提交
+    commits: set[str] = set()
+    cursor = head
+    while cursor and cursor not in commits:
+        commits.add(cursor)
+        status, info = client.request(
+            'GET', '/repos/%s/%s/git/commits/%s' % (owner, repo, cursor), raw=True)
+        if status != 200:
+            break
+        parents = info.get('parents') or []
+        cursor = parents[0]['sha'] if parents else ''
+
+    # 递归列树，收集已有 blob
+    blobs: set[str] = set()
+    status, tree = client.request(
+        'GET', '/repos/%s/%s/git/trees/%s?recursive=1' % (owner, repo, head),
+        raw=True)
+    if status == 200:
+        for item in tree.get('tree') or []:
+            if item.get('type') == 'blob':
+                blobs.add(item['sha'])
+    return head, commits, blobs
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--dry-run', action='store_true',
@@ -272,10 +316,26 @@ def main() -> int:
     print('\n==> 0/4 检查仓库状态')
     bootstrap_if_empty(client, owner, repo)
 
-    # 1) 上传 blob
+    # 读出远端已有对象 → 只推增量
+    remote_head, remote_commits, remote_blobs = remote_state(client, owner, repo)
+    todo = [plan for plan in plans if plan['sha'] not in remote_commits]
+    if not todo:
+        print('远端已经是最新（%s），无需推送' % remote_head[:8])
+        return 0
+    print('  远端 HEAD %s · 已有 blob %d 个'
+          % (remote_head[:8] if remote_head else '(空)', len(remote_blobs)))
+    print('  待推送提交 %d 个，跳过已有 blob %d 个'
+          % (len(todo), len([s for s in blob_cache if s in remote_blobs])))
+
+    # 1) 上传 blob（跳过远端已存在的）
     print('==> 1/4 上传 blob')
     uploaded: dict[str, str] = {}
-    for index, (sha, _) in enumerate(sorted(blob_cache.items()), 1):
+    for sha in remote_blobs:
+        if sha in blob_cache:
+            uploaded[sha] = sha          # 远端已有，直接用同一 sha
+    need_upload = [sha for sha in blob_cache if sha not in uploaded]
+    print('    需上传 %d 个，复用 %d 个' % (len(need_upload), len(uploaded)))
+    for index, sha in enumerate(sorted(need_upload), 1):
         content = git('cat-file', 'blob', sha)
         result = client.request(
             'POST', '/repos/%s/%s/git/blobs' % (owner, repo),
@@ -287,13 +347,13 @@ def main() -> int:
             raise RuntimeError('blob %s 上传失败：%s'
                                % (sha[:8], str(result)[:300]))
         uploaded[sha] = new_sha
-        if index % 20 == 0 or index == len(blob_cache):
-            print('    %d/%d' % (index, len(blob_cache)))
+        if index % 20 == 0 or index == len(need_upload):
+            print('    %d/%d' % (index, len(need_upload)))
 
     # 2) 重建 tree
     print('==> 2/4 重建 tree')
     tree_shas: dict[str, str] = {}
-    for plan in plans:
+    for plan in todo:
         entries = []
         for item in plan['files']:
             entries.append({
@@ -310,8 +370,9 @@ def main() -> int:
 
     # 3) 重建 commit（保留 author/committer 时间，sha 才能一致）
     print('==> 3/4 重建 commit')
-    new_shas: dict[str, str] = {}
-    for plan in plans:
+    new_shas: dict[str, str] = {plan['sha']: plan['sha'] for plan in plans
+                                if plan['sha'] in remote_commits}
+    for plan in todo:
         info = plan['info']
         payload = {
             'message': info['message'],
