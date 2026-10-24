@@ -215,7 +215,7 @@ public final class TgcpEngine {
         }
         let parsed = try Tgcp.parseDhPublic(frame.rawHeader)
         clientPublic = parsed.value
-        clientKey = try clientSide.deriveKey(parsed.value)
+        clientKey = try clientSide.deriveKey(peerPublic: parsed.value)
         let header = try Tgcp.replaceDhPublic(frame.rawHeader,
                                              serverSide.publicBytes)
         log("[ch] c2s hello（client_key 就绪）")
@@ -231,7 +231,7 @@ public final class TgcpEngine {
         }
         let parsed = try Tgcp.parseDhPublic(frame.rawHeader)
         serverPublic = parsed.value
-        serverKey = try serverSide.deriveKey(parsed.value)
+        serverKey = try serverSide.deriveKey(peerPublic: parsed.value)
         let header = try Tgcp.replaceDhPublic(frame.rawHeader,
                                              clientSide.publicBytes)
 

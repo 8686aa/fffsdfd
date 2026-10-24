@@ -335,7 +335,10 @@ public final class UdpRelay {
             return cached
         }
         lock.unlock()
-        guard let ip = try? HostResolver.ipv4(host), let value = ip else { return nil }
+        // HostResolver.ipv4 返回 String?，`try?` 会把它 flatten 成 String?，
+        // 所以只需要解一层。写成 `guard let ip = try?, let value = ip` 会因为
+        // ip 已经是 String 而报 "must have Optional type"。
+        guard let value = try? HostResolver.ipv4(host) else { return nil }
         lock.lock()
         if dnsCache.count > 128 { dnsCache.removeAll() }
         dnsCache[host] = value

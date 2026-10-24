@@ -43,10 +43,11 @@ public enum LanAddress {
             if flags & IFF_UP == 0 || flags & IFF_LOOPBACK != 0 { continue }
 
             let name = String(cString: entry.pointee.ifa_name)
-            var host = [CChar](repeating: 0, count: Int(NET_ADDRSTRLEN))
+            // 用 INET_ADDRSTRLEN：Darwin 模块没有导出 macOS 私有的 NET_ADDRSTRLEN
+            var host = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
             address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { pointer in
                 var raw = pointer.pointee.sin_addr
-                inet_ntop(AF_INET, &raw, &host, socklen_t(NET_ADDRSTRLEN))
+                inet_ntop(AF_INET, &raw, &host, socklen_t(INET_ADDRSTRLEN))
             }
             let ip = String(cString: host)
             if ip.isEmpty || ip.hasPrefix("169.254.") { continue }   // 自分配地址
