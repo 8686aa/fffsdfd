@@ -139,7 +139,12 @@ class Client:
         self.calls = 0
 
     def request(self, method: str, path: str, payload: dict | None = None,
-                retries: int = 4) -> dict:
+                retries: int = 4, raw: bool = False):
+        """发一个请求。
+
+        @param raw 为 True 时返回 `(状态码, 响应体)` 而不是只返回体 ——
+               用于「409 也算有效答案」的探测（如判断仓库是否为空）。
+        """
         url = API + path
         data = None
         if payload is not None:
@@ -156,9 +161,16 @@ class Client:
                 with urllib.request.urlopen(request, timeout=45) as response:
                     self.calls += 1
                     body = response.read().decode('utf-8', 'replace')
-                    return json.loads(body) if body.strip() else {}
+                    parsed = json.loads(body) if body.strip() else {}
+                    return (response.status, parsed) if raw else parsed
             except urllib.error.HTTPError as error:
+                self.calls += 1
                 detail = error.read().decode('utf-8', 'replace')
+                if raw:
+                    try:
+                        return error.code, json.loads(detail) if detail else {}
+                    except json.JSONDecodeError:
+                        return error.code, {'message': detail}
                 # 422 常见于「引用已存在 / 内容未变化」，交给调用方判断
                 if error.code in (422, 409):
                     return {'__status__': error.code, '__body__': detail}
@@ -177,6 +189,41 @@ class Client:
 
 
 # ── 主流程 ──────────────────────────────────────────────────────
+
+def bootstrap_if_empty(client: Client, owner: str, repo: str) -> bool:
+    """仓库完全为空时，先用 Contents API 塞一个占位文件。
+
+    ## 为什么必须这一步
+
+    Git Data API（blobs / trees / commits）在**空仓库上直接返回 409**
+    `Git Repository is empty.` —— 哪怕只是创建一个 blob。这是 GitHub 的
+    设计：那些接口都要求仓库已经有一个提交作为起点。
+
+    实测踩过：脚本把 409 当作成功（`result.get('sha', sha)` 回落到本地 sha），
+    于是 blob 看起来全传完了，到建 tree 时才炸在 KeyError。
+
+    这里用一个占位文件把仓库「点着」，随后建的正式根提交会把它顶掉，
+    ref 强制指过去之后占位提交变成 unreachable，GitHub 会自行回收。
+
+    @return 是否真的做了初始化（调用方据此提示）
+    """
+    status, _ = client.request('GET', '/repos/%s/%s/git/refs/heads/%s'
+                               % (owner, repo, BRANCH), raw=True)
+    if status != 409:
+        return False                      # 已有内容，不用管
+
+    print('  仓库是空的，先用 Contents API 建一个占位提交…')
+    body = b'# placeholder\n'
+    result = client.request(
+        'PUT', '/repos/%s/%s/contents/%s' % (owner, repo, '.sr-bootstrap'),
+        {'message': 'chore: bootstrap',
+         'content': base64.b64encode(body).decode('ascii')})
+    if result.get('__status__'):
+        raise RuntimeError('初始化空仓库失败：%s'
+                           % str(result.get('__body__'))[:300])
+    print('  已初始化（后续会用正式提交覆盖）')
+    return True
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -221,8 +268,12 @@ def main() -> int:
 
     client = Client(token)
 
+    # 0) 空仓库要先「点着」：Git Data API 在空仓库上直接 409
+    print('\n==> 0/4 检查仓库状态')
+    bootstrap_if_empty(client, owner, repo)
+
     # 1) 上传 blob
-    print('\n==> 1/4 上传 blob')
+    print('==> 1/4 上传 blob')
     uploaded: dict[str, str] = {}
     for index, (sha, _) in enumerate(sorted(blob_cache.items()), 1):
         content = git('cat-file', 'blob', sha)
@@ -230,8 +281,13 @@ def main() -> int:
             'POST', '/repos/%s/%s/git/blobs' % (owner, repo),
             {'content': base64.b64encode(content).decode('ascii'),
              'encoding': 'base64'})
-        uploaded[sha] = result.get('sha', sha)
-        if index % 10 == 0 or index == len(blob_cache):
+        new_sha = result.get('sha')
+        if not new_sha:
+            # 绝不能静默回落成本地 sha —— 那会让后面的 tree 用不存在的对象
+            raise RuntimeError('blob %s 上传失败：%s'
+                               % (sha[:8], str(result)[:300]))
+        uploaded[sha] = new_sha
+        if index % 20 == 0 or index == len(blob_cache):
             print('    %d/%d' % (index, len(blob_cache)))
 
     # 2) 重建 tree

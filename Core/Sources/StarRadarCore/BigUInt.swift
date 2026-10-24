@@ -17,7 +17,7 @@ import Foundation
  little-endian 的 32 位 limb 数组，尾部不留 0（归一化）。
  与 JVM 的 `BigInteger` 只在 **值** 上等价，不共享内部表示。
  */
-public struct BigUInt {
+public struct BigUInt: Comparable {
     /// little-endian limbs，高位不带尾随 0。
     public private(set) var limbs: [UInt32]
 

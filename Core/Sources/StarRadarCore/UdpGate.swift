@@ -182,6 +182,10 @@ public final class UdpGate {
         }
 
         switch portVerdict(datagram.serverPort) {
+        // portVerdict 只会返回 .pass / .drop / nil，但编译器要求把
+        // `.hold` 也列出来（`State?` 的穷尽性按 State 的全部 case 算）。
+        case .hold, nil:
+            break
         case .pass:
             lock.lock()
             passed += 1
@@ -195,8 +199,6 @@ public final class UdpGate {
             noteBlocked(datagram.serverPort, 1, datagram.size, 0, "端口")
             lock.unlock()
             return []
-        case nil:
-            break
         }
 
         lock.lock()

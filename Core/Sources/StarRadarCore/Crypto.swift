@@ -1,5 +1,7 @@
 import Foundation
 import CryptoKit
+// SecRandomCopyBytes / kSecRandomDefault 属于 Security（CryptoKit 不带）
+import Security
 
 /**
  哈希 / HMAC / HKDF / AES-GCM —— 全部走 CryptoKit。
@@ -61,9 +63,13 @@ public enum Crypto {
     public static func gcmSeal(key: [UInt8], iv: [UInt8], plaintext: [UInt8],
                                aad: [UInt8]) throws -> [UInt8] {
         let symmetric = SymmetricKey(data: key)
-        let nonce = try AES.GCM.Nonce(data: Data(iv))
-        let sealed = try AES.GCM.seal(Data(plaintext), using: symmetric,
-                                      nonce: nonce, authenticating: Data(aad))
+        // ⚠️ 必须写全限定 `CryptoKit.AES`：本模块自己也定义了一个 `AES`
+        // （AES-CBC 那份），未限定时 Swift 会优先解析本模块的类型，
+        // 于是 `AES.GCM` 报 "type 'AES' has no member 'GCM'"。
+        let nonce = try CryptoKit.AES.GCM.Nonce(data: Data(iv))
+        let sealed = try CryptoKit.AES.GCM.seal(Data(plaintext), using: symmetric,
+                                                nonce: nonce,
+                                                authenticating: Data(aad))
         return Array(sealed.ciphertext) + Array(sealed.tag)
     }
 
@@ -75,12 +81,12 @@ public enum Crypto {
         let body = Array(sealed[0..<(sealed.count - 16)])
         let tag = Array(sealed[(sealed.count - 16)...])
         let symmetric = SymmetricKey(data: key)
-        let nonce = try AES.GCM.Nonce(data: Data(iv))
-        let box = try AES.GCM.SealedBox(nonce: nonce,
-                                        ciphertext: Data(body),
-                                        tag: Data(tag))
-        return Array(try AES.GCM.open(box, using: symmetric,
-                                      authenticating: Data(aad)))
+        let nonce = try CryptoKit.AES.GCM.Nonce(data: Data(iv))
+        let box = try CryptoKit.AES.GCM.SealedBox(nonce: nonce,
+                                                  ciphertext: Data(body),
+                                                  tag: Data(tag))
+        return Array(try CryptoKit.AES.GCM.open(box, using: symmetric,
+                                                authenticating: Data(aad)))
     }
 
     /// 定长比较。普通 `==` 会在第一个不同字节处提前返回，给了侧信道；
