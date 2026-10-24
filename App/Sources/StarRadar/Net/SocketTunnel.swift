@@ -1,4 +1,5 @@
 import Foundation
+import StarRadarCore
 
 /**
  一条被翻译的 SOCKS5 连接 —— 两端都是系统 socket。

@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import UIKit
+import StarRadarCore
 
 /**
  后台保活。

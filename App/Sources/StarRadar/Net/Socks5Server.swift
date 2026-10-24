@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import StarRadarCore
 
 /**
  局域网 SOCKS5 服务端 —— 与 `Socks5Server.kt` 等价。

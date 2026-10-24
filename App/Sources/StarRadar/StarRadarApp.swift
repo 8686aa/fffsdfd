@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import StarRadarCore
 
 @main
 struct StarRadarApp: App {

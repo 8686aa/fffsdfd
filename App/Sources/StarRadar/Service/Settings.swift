@@ -1,4 +1,5 @@
 import Foundation
+import StarRadarCore
 
 /// 配置持久化（UserDefaults）—— 与 Android 端 `Settings.kt` 的字段一致。
 final class Settings {

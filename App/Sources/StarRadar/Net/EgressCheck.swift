@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import StarRadarCore
 
 /**
  出站指纹自检 —— 与 `EgressCheck.kt` 同思路。

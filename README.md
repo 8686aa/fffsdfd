@@ -149,3 +149,29 @@ TrollStore 等）安装；企业签名/自签证书的流程不在本仓库范�
 
 第一次真机跑建议按这个顺序看：节点自检 → 另一台设备连接 → 界面「连接/活跃」
 是否上涨 → 「对局参数」是否出现。
+
+---
+
+## 推送到你自己的仓库
+
+本目录已经是一个初始化好的 git 仓库（含一次提交），但**没有任何远程地址**，
+也没有可用的推送凭据（`ssh -T git@github.com` 返回 `Permission denied (publickey)`）。
+补上远程即可：
+
+```bash
+cd starradar-ios
+git remote add origin git@github.com:<你的账号>/<仓库名>.git
+git branch -M main
+git push -u origin main
+```
+
+推送后 GitHub Actions 会自动跑：
+
+- `Core 向量测试`（`swift test`，与 PC/Android 对同一批向量）
+- `无签名 ipa`（`xcodegen` + `xcodebuild` + 打包 `Payload/`）
+
+产物在 Actions 运行页面的 **Artifacts → StarRadar-unsigned-ipa**。
+需要登录 GitHub 才能下载，这也意味着仓库可以是私有的。
+
+想先在本地验证再推：`git bundle create starradar-ios.bundle --all`，
+把 `.bundle` 拷到有 Xcode 的机器上 `git clone starradar-ios.bundle`。

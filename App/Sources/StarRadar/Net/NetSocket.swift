@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import StarRadarCore
 
 /**
  一层薄薄的 BSD socket 封装。

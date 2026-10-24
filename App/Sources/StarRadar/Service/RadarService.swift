@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import StarRadarCore
 
 /**
  采集总控 —— 与 Android 端 `RadarService` 的职责一致。

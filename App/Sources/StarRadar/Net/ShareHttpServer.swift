@@ -1,4 +1,5 @@
 import Foundation
+import StarRadarCore
 
 /**
  极小的 HTTP 服务 —— 只为了让 sing-box 拉到配置。

@@ -1,4 +1,5 @@
 import Foundation
+import StarRadarCore
 
 /// 等「任一方向结束」的收尾工具。
 ///

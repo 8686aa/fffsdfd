@@ -1,4 +1,5 @@
 import Foundation
+import StarRadarCore
 
 /**
  TGCP 帧翻译引擎 —— 与 `TgcpEngine.kt` 等价的传输无关部分。

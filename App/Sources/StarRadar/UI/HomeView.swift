@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import StarRadarCore
 
 /// 主界面 —— 与 Android 端「采集卡 + 地址卡 + 扫码」的结构一致。
 struct HomeView: View {

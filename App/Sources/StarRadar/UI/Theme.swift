@@ -1,4 +1,5 @@
 import SwiftUI
+import StarRadarCore
 
 /// 配色与 PC / Android 端一致：白底 + 橙。
 enum Sr {

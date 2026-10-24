@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import StarRadarCore
 
 /**
  局域网地址发现 —— 与 `LanAddress.kt` 等价。

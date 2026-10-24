@@ -1,5 +1,6 @@
 import SwiftUI
 import WebKit
+import StarRadarCore
 
 /**
  内置网页 —— 全屏 WKWebView + 左上角返回气泡。

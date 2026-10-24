@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import StarRadarCore
 
 /**
  SOCKS5 的 UDP relay —— 与 `Socks5UdpRelay.kt` 等价。
