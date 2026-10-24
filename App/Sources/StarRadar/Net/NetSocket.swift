@@ -85,6 +85,7 @@ public final class NetSocket {
         _ = fcntl(fd, F_SETFL, flags)          // 恢复阻塞模式
         let socket = NetSocket(fd: fd)
         socket.setNoDelay()
+        socket.setNoSigPipe()
         return socket
     }
 
@@ -135,7 +136,11 @@ public final class NetSocket {
         var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
         inet_ntop(AF_INET, &address.sin_addr, &buffer, socklen_t(INET_ADDRSTRLEN))
         let peer = String(cString: buffer)
-        return (NetSocket(fd: client), peer)
+        let socket = NetSocket(fd: client)
+        // accept 出来的 fd 是新的，选项不继承 —— 必须单独设。
+        socket.setNoDelay()
+        socket.setNoSigPipe()
+        return (socket, peer)
     }
 
     // ── 读写 ──────────────────────────────────────────────────
@@ -216,6 +221,30 @@ public final class NetSocket {
     public func setNoDelay() {
         var value: Int32 = 1
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &value,
+                   socklen_t(MemoryLayout<Int32>.size))
+    }
+
+    /**
+     禁用 SIGPIPE。
+
+     ## 为什么这条是必须的
+
+     Darwin 上向一个**已被对端关闭**的 socket 写数据，内核会给进程发
+     `SIGPIPE`，而它的默认处置是**终止进程**。也就是说：
+
+     客户端（另一台手机 / 游戏）一断开，我们下一次往它写数据就会让
+     **整个 App 被系统杀掉** —— 所有连接同时消失，用户看到的是
+     「突然完全断网」，而且重新打开 App 时什么线索都没有。
+
+     macOS/iOS 没有 `MSG_NOSIGNAL`（那是 Linux 的），对应物是 socket 级
+     选项 `SO_NOSIGPIPE`。必须在**每个 fd** 上设一次（accept 出来的也要）。
+
+     设上之后，写已关闭的连接只会返回 `EPIPE` 错误，由 `write` 正常抛出，
+     调用方按「对端已断开」处理即可，进程不受影响。
+     */
+    public func setNoSigPipe() {
+        var value: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &value,
                    socklen_t(MemoryLayout<Int32>.size))
     }
 
