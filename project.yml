@@ -24,8 +24,8 @@ targets:
         PRODUCT_NAME: StarRadar
         # 版本必须在界面上可见：侧载安装后「装的是哪个包」本来无从确认，
         # 而排查「改了没效果」时这是第一个要排除的可能。
-        MARKETING_VERSION: "1.0.3"
-        CURRENT_PROJECT_VERSION: "3"
+        MARKETING_VERSION: "1.0.4"
+        CURRENT_PROJECT_VERSION: "4"
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1,2"
         INFOPLIST_FILE: App/Info.plist

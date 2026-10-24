@@ -42,6 +42,14 @@ public final class Socks5Server {
     public static let maxConnections = 256
     public static let halfCloseGraceMs = 3000
 
+    /// 同时存在的 UDP 关联上限。
+    ///
+    /// 客户端在 UDP 不通时会不停地重开关联，而**旧的往往不关**（现场见过
+    /// 40 秒内 18 个）。每个关联占 1 个控制连接 + 1 个 relay socket + 1 个
+    /// 线程，不设上限就是稳定泄漏，最后连 TCP 都开不出来。
+    /// 超过上限时关掉最老的那个 —— 新的那个才是客户端现在在用的。
+    public static let maxRelays = 32
+
     public let port: Int
     public let targetPorts: Set<Int>
 
@@ -435,17 +443,51 @@ public final class Socks5Server {
 
         lock.lock()
         relays.append(relay)
+        var evicted: UdpRelay?
+        if relays.count > Socks5Server.maxRelays {
+            evicted = relays.removeFirst()
+        }
         lock.unlock()
+        if let evicted {
+            log("[s5] UDP 关联数超过 \(Socks5Server.maxRelays)，关闭最老的一个"
+                + "（\(evicted.summaryLine())）")
+            evicted.close()
+        }
 
         relay.start()
-        log("[s5] UDP 关联已建立（\(bindIp):\(relay.port)）")
+        log("[s5] UDP 关联已建立（\(bindIp):\(relay.port) · 对端 \(peer)）")
+
+        // 5 秒后如果这个关联一个包都没收到，就明确告警。
+        //
+        // 这一条是整个 UDP 排查的分水岭：
+        //   · 有告警 → 客户端的 UDP 根本没到达本机（广告地址不对 / 局域网
+        //     不放行 UDP / 客户端把它发给了别的地址）
+        //   · 没告警但客户端仍不通 → 包到了但转不出去，看 relay 内部的
+        //     「解析失败 / 发送失败」那几行
+        // 以前这两种情况在日志里长得一模一样（什么都没有）。
+        DispatchQueue.global().asyncAfter(
+            deadline: .now() + .milliseconds(Int(UdpRelay.probeAfterMs))
+        ) { [weak relay] in
+            guard let relay, relay.isRunning else { return }
+            let seconds = UdpRelay.probeAfterMs / 1000
+            if relay.packetsRaw == 0 {
+                self.log("[s5] ⚠️ UDP 关联 \(bindIp):\(relay.port) 建立 "
+                         + "\(seconds) 秒仍未收到任何 UDP 包（对端 \(peer)）")
+                self.log("[s5]    包的层面就没到：确认客户端把 UDP 发到了 "
+                         + "\(bindIp):\(relay.port)，且局域网放行 UDP")
+            } else if relay.packetsIn == 0 {
+                // 到了却被源地址校验挡掉 —— 这条以前完全看不见
+                self.log("[s5] ⚠️ UDP 关联 \(bindIp):\(relay.port) 收到 "
+                         + "\(relay.packetsRaw) 个包但全部被源地址校验挡掉"
+                         + "（申请者 \(peer)）")
+            }
+        }
 
         defer {
             lock.lock()
             relays.removeAll { $0 === relay }
             lock.unlock()
-            let snapshot = relay.snapshot()
-            log("[s5] UDP 关联已关闭（收 \(snapshot["in"] ?? 0) 包 / 发 \(snapshot["out"] ?? 0) 包）")
+            log("[s5] UDP 关联已关闭（\(relay.summaryLine())）")
             relay.close()
         }
 
