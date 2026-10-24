@@ -74,6 +74,14 @@ public final class TgcpEngine {
     private var seenMaterials = Set<String>()
     private var scanFrames = 0
 
+    /// 最近的帧轨迹（环形，最多 `traceKeep` 条）。
+    ///
+    /// 排查「连上就断」时这是最有用的一件东西：能直接看出退出前那几帧
+    /// 是什么命令、多大 body、被怎么处理的。没有它，现场只有一句
+    /// 「连接结束」，无法区分「服务器关的」和「我们自己分帧失败的」。
+    private var trace: [String] = []
+    public static let traceKeep = 24
+
     private let c2sFramer = Tgcp.Framer()
     private let s2cFramer = Tgcp.Framer()
 
@@ -169,8 +177,31 @@ public final class TgcpEngine {
         return true
     }
 
+    private func note(_ direction: Direction, _ frame: Tgcp.Frame,
+                      _ action: String) {
+        let tag = direction == .c2s ? "c2s" : "s2c"
+        let line = String(format: "%@ %@ b=%d h=%d %@",
+                          tag, frame.commandName, frame.body.count,
+                          frame.rawHeader.count, action)
+        trace.append(line)
+        if trace.count > TgcpEngine.traceKeep {
+            trace.removeFirst(trace.count - TgcpEngine.traceKeep)
+        }
+    }
+
     private func emitAll(_ emits: [Emit]) {
-        guard let sink else { return }
+        guard let sink else {
+            // 静默丢数据是最难查的一类故障：socket 两端都开着，对端只是
+            // 「没反应」，最后超时断开，而日志里什么都没有。
+            if !emits.isEmpty {
+                lock.lock()
+                if lastError.isEmpty {
+                    lastError = "输出通道已失效，丢弃 \(emits.count) 段数据"
+                }
+                lock.unlock()
+            }
+            return
+        }
         for item in emits {
             switch item.direction {
             case .c2s: sink.toUpstream(item.data)
@@ -197,16 +228,29 @@ public final class TgcpEngine {
         }
 
         if !keysReady {
-            // 握手没完成就来了应用帧：缓存，等握手完成补发
-            if pending.count < TgcpEngine.pendingMaxFrames &&
-                pendingBytes < TgcpEngine.pendingMaxBytes {
-                pending.append((direction, frame))
-                pendingBytes += frame.body.count
-                log("[ch] 握手未完成，缓存一帧（\(frame.commandName)）")
+            // 握手没完成就来了应用帧：缓存，等握手完成补发。
+            //
+            // ⚠️ 溢出**必须报错断开**，不能静默丢帧。
+            // 曾经写成「超了就跳过」—— 丢掉一帧等于丢掉一段字节，整条
+            // TGCP 流立刻错位，对端解不开；而现象是「连接还在、但什么都不
+            // 通」，日志里连个错误都看不到。PC 版这里一直是 raise。
+            if pending.count >= TgcpEngine.pendingMaxFrames ||
+                pendingBytes >= TgcpEngine.pendingMaxBytes {
+                let message = "应用帧等不到握手完成（已攒 \(pending.count) 帧 / "
+                    + "\(pendingBytes) 字节）"
+                lastError = message
+                note(direction, frame, "pending-overflow")
+                log("[ch] \(message)")
+                throw ProxyError(message)
             }
+            pending.append((direction, frame))
+            pendingBytes += frame.body.count
+            note(direction, frame, "pending")
+            log("[ch] 握手未完成，缓存一帧（\(frame.commandName)）")
             return []
         }
-        return [Emit(direction: direction, data: translateApplicationBody(direction, frame))]
+        let data = translateApplicationBody(direction, frame)
+        return [Emit(direction: direction, data: data)]
     }
 
     private func handleClientHello(_ frame: Tgcp.Frame) throws -> [Emit] {
@@ -218,7 +262,8 @@ public final class TgcpEngine {
         clientKey = try clientSide.deriveKey(peerPublic: parsed.value)
         let header = try Tgcp.replaceDhPublic(frame.rawHeader,
                                              serverSide.publicBytes)
-        log("[ch] c2s hello（client_key 就绪）")
+        note(.c2s, frame, "rewrite-client-hello")
+        log("[ch] c2s hello（client_key 就绪，header \(frame.rawHeader.count) B）")
         var emits = [Emit(direction: .c2s,
                           data: frame.withHeader(header).pack())]
         emits.append(contentsOf: flushPendingLocked())
@@ -247,7 +292,14 @@ public final class TgcpEngine {
             }
         }
         handshakeDone = true
+        note(.s2c, frame, translated ? "rewrite-server-hello" : "hello-body-plain")
         log("[ch] s2c hello（server_key 就绪，body 翻译=\(translated ? "是" : "否")）")
+        if !body.isEmpty && !translated {
+            // 这条很关键：server hello 的 body 如果是密文而我们没翻成功，
+            // 客户端用 client_key 解不开，2~11 秒后就会 EOF ——
+            // 现象和「服务器踢人」一模一样，极易误判。
+            log("[ch] ⚠️ server hello 的 body 未能翻译，原样透传（客户端可能解不开）")
+        }
 
         var emits = [Emit(direction: .s2c,
                           data: frame.withParts(newHeader: header,
@@ -258,7 +310,10 @@ public final class TgcpEngine {
 
     private func translateApplicationBody(_ direction: Direction,
                                           _ frame: Tgcp.Frame) -> [UInt8] {
-        if frame.body.isEmpty { return frame.pack() }
+        if frame.body.isEmpty {
+            note(direction, frame, "pass-empty")
+            return frame.pack()
+        }
         guard let clientKey, let serverKey else { return frame.pack() }
 
         let sourceKey = direction == .c2s ? clientKey : serverKey
@@ -269,11 +324,15 @@ public final class TgcpEngine {
                                                 destKey: destKey,
                                                 body: frame.body) {
             translatedBody += 1
+            note(direction, frame, "translate")
             inspectPlain(direction, frame, result.plain)
             return frame.withBody(result.cipher).pack()
         }
+        // 解不开 → 当明文原样透传。这是正确行为（有些帧本来就是明文），
+        // 但要在轨迹里留痕，否则「一直透传」和「一直翻译」看起来一样。
+        note(direction, frame, "pass-plain")
         inspectPlain(direction, frame, frame.body)
-        return frame.body.isEmpty ? frame.pack() : frame.withBody(frame.body).pack()
+        return frame.withBody(frame.body).pack()
     }
 
     /// 握手完成后补发缓存帧。
@@ -390,6 +449,7 @@ public final class TgcpEngine {
             "materials": materials,
             "pending": pending.count,
             "error": lastError,
+            "trace": trace,
         ]
     }
 }

@@ -333,7 +333,7 @@ public final class Socks5Server {
                          onKey: onKey, log: log).run()
         } else {
             plainTcp += 1
-            plainPipe(client, upstream)
+            plainPipe(client, upstream, dstPort)
         }
     }
 
@@ -344,20 +344,31 @@ public final class Socks5Server {
      把两边都关掉。HTTP 的 chunked、以及大部分长连接都会「发完就关写端、
      继续读」，砍掉另一头会让客户端拿到残缺响应。
      */
-    private func plainPipe(_ client: NetSocket, _ upstream: NetSocket) {
-        let a = Thread { [weak self] in self?.pipe(client, upstream, true) }
+    private func plainPipe(_ client: NetSocket, _ upstream: NetSocket,
+                           _ dstPort: Int) {
+        let started = Date()
+        let upExit = ExitSignal(tag: "c2s")
+        let downExit = ExitSignal(tag: "s2c")
+
+        let a = Thread { [weak self] in
+            self?.pipe(client, upstream, true, upExit)
+        }
         a.name = "s5-htp-c2s"
-        a.stackSize = 256 * 1024
-        let b = Thread { [weak self] in self?.pipe(upstream, client, false) }
+        a.stackSize = 512 * 1024
+        let b = Thread { [weak self] in
+            self?.pipe(upstream, client, false, downExit)
+        }
         b.name = "s5-htp-s2c"
-        b.stackSize = 256 * 1024
+        b.stackSize = 512 * 1024
         a.start()
         b.start()
+
         // ⚠️ 这里的语义是「不限时等某个方向结束，再给另一个 3 秒收尾」。
         // 曾经写成「最多等 3 秒就无条件关」—— 那等于给每条转发连接设了
         // 3 秒寿命，另一台设备的网页、API 全部打不开（表现为整个断网，
         // 而不只是某个游戏掉线）。
-        ThreadJoin.either(a, b, graceMs: Socks5Server.halfCloseGraceMs) {
+        let outcome = ThreadJoin.either(upExit, downExit,
+                                        graceMs: Socks5Server.halfCloseGraceMs) {
             // 只有「一方结束后另一方仍卡着」才会走到这里。
             // 先 shutdown 再 close：close 唤不醒另一个线程里阻塞的 read。
             client.shutdownBoth()
@@ -365,23 +376,40 @@ public final class Socks5Server {
         }
         client.close()
         upstream.close()
+
+        // 普通转发是最常见的连接（网页/API/HTTPS 全是），所以这里只在
+        // 「非正常结束」时打日志：正常 EOF 不刷屏，异常才留痕。
+        let abnormal = outcome.forced || outcome.firstReason.contains("读失败")
+        if abnormal {
+            let seconds = String(format: "%.1f", Date().timeIntervalSince(started))
+            log("[s5] 转发异常结束（:\(dstPort) · 持续 \(seconds)s · "
+                + "先退出：\(outcome.firstExit)（\(outcome.firstReason)）"
+                + (outcome.forced ? " · 另一方向被强制断开" : "") + "）")
+        }
     }
 
     /// 单向泵：读 from 写 to，EOF 时把 EOF 传给 to。
-    private func pipe(_ from: NetSocket, _ to: NetSocket, _ isUp: Bool) {
+    private func pipe(_ from: NetSocket, _ to: NetSocket, _ isUp: Bool,
+                      _ exit: ExitSignal) {
         var buffer = [UInt8](repeating: 0, count: 16384)
         while true {
             let count = from.read(&buffer)
             if count < 0 {
-                if errno == EINTR { continue }
+                let code = errno
+                if code == EINTR { continue }
                 // 读超时不能当连接结束（见 SocketTunnel.pump 的同类注释）
-                if errno == EAGAIN || errno == EWOULDBLOCK { continue }
+                if code == EAGAIN || code == EWOULDBLOCK { continue }
+                exit.fire("读失败 errno \(code)")
+                return
+            }
+            if count == 0 {
+                exit.fire("对端 EOF")
                 break
             }
-            if count == 0 { break }
             do {
                 try to.write(Array(buffer[0..<count]))
             } catch {
+                exit.fire("写对端失败")
                 break
             }
             if isUp { bytesIn += Int64(count) } else { bytesOut += Int64(count) }

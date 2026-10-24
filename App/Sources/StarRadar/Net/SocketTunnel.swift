@@ -11,20 +11,28 @@ import StarRadarCore
 
  ## 写操作为什么要各自加锁
 
- 每个方向的 socket 可能被**两个**线程写：一帧的直接发送在读取线程上，
- 而「握手前缓存的帧补发」发生在另一个方向解析到 hello 的那个线程上。
- 不锁的话两个 TGCP 帧会交错，对端分帧立刻错位 —— 现象是「握手成功、
- 之后全是垃圾」。
+ 每个方向的 socket 可能被**两个**线程写：一帧的直接发送在读取线程上，而
+ 「握手前缓存的帧补发」发生在另一个方向解析到 hello 的那个线程上。不锁的话
+ 两个 TGCP 帧会交错，对端分帧立刻错位 —— 现象是「握手成功、之后全是垃圾」。
 
  ## 半关闭
 
- 客户端发完请求就关写端是合法行为，服务器此时还在回包。所以客户端 EOF
- 不能直接 close —— 要把 EOF 传给上游，给它一段宽限把剩下的数据回完。
+ 客户端发完请求就关写端是合法行为，服务器此时还在回包。所以客户端 EOF 不能
+ 直接 close —— 要把 EOF 传给上游，给它一段宽限把剩下的数据回完。
+
+ ## 退出诊断
+
+ 每条连接结束时会打一行完整结论：持续时长、两方向帧数、谁先退出、退出原因、
+ 最后几帧的轨迹。排「连上就断」这类问题时，这一行基本就能定位：
+ 是服务器关的、是我们分帧失败的、还是客户端走了。
  */
 public final class SocketTunnel {
 
     /// 客户端关写端之后，等服务器把剩下的回完的宽限。
     public static let halfCloseGraceMs = 3000
+
+    /// 帧轨迹保留条数。够看清退出前发生了什么，又不会吃内存。
+    public static let traceKeep = 12
 
     private let client: NetSocket
     private let upstream: NetSocket
@@ -34,10 +42,6 @@ public final class SocketTunnel {
 
     private let clientLock = NSLock()
     private let upstreamLock = NSLock()
-
-    /// 记录哪个方向先退出（两个 pump 线程都会写）。
-    private let exitLock = NSLock()
-    private var exitTag: String?
 
     public init(client: NetSocket, upstream: NetSocket,
                 sessionInfo: @escaping () -> (String, Int),
@@ -51,14 +55,30 @@ public final class SocketTunnel {
     }
 
     private final class SinkImpl: TgcpEngine.Sink {
-        weak var owner: SocketTunnel?
+        /// **强引用** owner。
+        ///
+        /// 这里踩过一个很危险的坑，值得写下来：`TgcpEngine.sink` 是 `weak`，
+        /// 所以 sink 必须由调用方强持有。曾经把赋值写成
+        /// `engine.sink = SinkImpl(owner: self)`（临时对象）—— 赋值完临时对象
+        /// 立刻释放，`engine.sink` 当场变成 nil，于是**所有翻译后的数据都被
+        /// 静默丢弃**：socket 两端都开着、对端收不到任何回包、最后超时断开，
+        /// 而现场日志里连一个错误都没有。
+        ///
+        /// 所以：sink 由 `run()` 的局部变量强持有，sink 自己强引用 owner。
+        /// 这样既不会提前释放，也不会因为 owner 释放而崩溃（owner 由 run()
+        /// 的栈帧保证存活，退出时 sink 随之释放）。
+        let owner: SocketTunnel
+
+        init(owner: SocketTunnel) {
+            self.owner = owner
+        }
 
         func toClient(_ data: [UInt8]) {
-            owner?.writeClient(data)
+            owner.writeClient(data)
         }
 
         func toUpstream(_ data: [UInt8]) {
-            owner?.writeUpstream(data)
+            owner.writeUpstream(data)
         }
     }
 
@@ -84,29 +104,38 @@ public final class SocketTunnel {
 
     public func run() {
         let engine = TgcpEngine(onKey: onKey, sessionInfo: sessionInfo, log: log)
-        let sink = SinkImpl()
-        sink.owner = self
+        // ⚠️ 必须用局部变量持有 sink：`engine.sink` 是 weak，写成
+        // `engine.sink = SinkImpl(owner: self)` 会让它在下一行就变 nil。
+        let sink = SinkImpl(owner: self)
         engine.sink = sink
 
         let started = Date()
+        let c2sExit = ExitSignal(tag: "c2s")
+        let s2cExit = ExitSignal(tag: "s2c")
 
         let c2s = Thread { [weak self] in
-            guard let self else { return }
-            self.pump(self.client, "客户端→服务器", "c2s",
+            guard let self else {
+                c2sExit.fire("tunnel 已释放")
+                return
+            }
+            self.pump(self.client, "客户端→服务器", "c2s", c2sExit,
                       onData: { engine.feedC2s($0) },
                       onEnd: { self.upstream.shutdownWrite() })
         }
         c2s.name = "tun-c2s"
-        c2s.stackSize = 256 * 1024
+        c2s.stackSize = 512 * 1024
 
         let s2c = Thread { [weak self] in
-            guard let self else { return }
-            self.pump(self.upstream, "服务器→客户端", "s2c",
+            guard let self else {
+                s2cExit.fire("tunnel 已释放")
+                return
+            }
+            self.pump(self.upstream, "服务器→客户端", "s2c", s2cExit,
                       onData: { engine.feedS2c($0) },
                       onEnd: { self.client.shutdownWrite() })
         }
         s2c.name = "tun-s2c"
-        s2c.stackSize = 256 * 1024
+        s2c.stackSize = 512 * 1024
 
         c2s.start()
         s2c.start()
@@ -115,61 +144,92 @@ public final class SocketTunnel {
         // （HTTP 短连接、游戏踢人、目标端口不存在时的 RST），那种情况下
         // c2s 还在安静地等客户端，而客户端可能永远不发也不关。
         //
-        // ⚠️ 这里的语义是「不限时等结束，再给另一方 3 秒收尾」。
-        // 曾经写成「最多等 3 秒就无条件收尾」，等于给每条连接设了 3 秒寿命
-        // —— 另一台设备表现为「连上就断」，日志里帧数永远停在 60 上下。
-        ThreadJoin.either(c2s, s2c, graceMs: SocketTunnel.halfCloseGraceMs) {
+        // ⚠️ 语义是「不限时等结束，再给另一方 3 秒收尾」。曾经写成
+        // 「最多等 3 秒就无条件收尾」，等于给每条连接设了 3 秒寿命。
+        let result = ThreadJoin.either(c2sExit, s2cExit,
+                                       graceMs: SocketTunnel.halfCloseGraceMs) {
             // 只有「一方结束后另一方仍卡着」才会走到这里。先 shutdown 再
             // close：close 唤不醒另一个线程里阻塞的 read。
-            log("[tun] 半关闭宽限到期，强制断开（先退出：\(self.firstExit ?? "?")）")
             self.client.shutdownBoth()
             self.upstream.shutdownBoth()
         }
         client.close()
         upstream.close()
 
+        logEnd(engine: engine, started: started, outcome: result)
+    }
+
+    private func logEnd(engine: TgcpEngine, started: Date,
+                        outcome: ThreadJoin.Outcome) {
         let stats = engine.snapshot()
         let seconds = String(format: "%.1f", Date().timeIntervalSince(started))
-        log("[tun] 连接结束（\(stats["framesC2s"] ?? 0)/\(stats["framesS2c"] ?? 0) 帧"
-            + "，持续 \(seconds)s，先退出：\(firstExit ?? "同时")）")
+        let frames = "\(stats["framesC2s"] ?? 0)/\(stats["framesS2c"] ?? 0) 帧"
+        let bytes = "\(stats["bytesC2s"] ?? 0)/\(stats["bytesS2c"] ?? 0) B"
+
+        var line = "[tun] 连接结束（\(frames) · \(bytes) · 持续 \(seconds)s）"
+        line += " · 先退出：\(outcome.firstExit.isEmpty ? "无" : outcome.firstExit)"
+        if !outcome.firstReason.isEmpty {
+            line += "（\(outcome.firstReason)）"
+        }
+        if outcome.forced {
+            line += " · 另一方向宽限到期被强制断开"
+        }
+        log(line)
+
+        // 引擎自己的失败原因单独打一遍：它通常是「连接为什么结束」的答案
+        let engineError = (stats["error"] as? String) ?? ""
+        if !engineError.isEmpty {
+            log("[tun] 引擎错误：\(engineError)")
+        }
+
+        // 最后几帧的轨迹。分帧错位、命令异常这类问题看这一行序列就够。
+        if let trace = stats["trace"] as? [String], !trace.isEmpty {
+            log("[tun] 最后 \(trace.count) 帧：")
+            for item in trace { log("[tun]   \(item)") }
+        }
     }
 
-    /// 哪个方向先结束。排查「连接为什么断」时这是最关键的一条信息。
-    private var firstExit: String? {
-        exitLock.lock()
-        defer { exitLock.unlock() }
-        return exitTag
-    }
-
-    private func noteExit(_ tag: String) {
-        exitLock.lock()
-        if exitTag == nil { exitTag = tag }
-        exitLock.unlock()
-    }
-
-    /// 读一侧的字节并喂给引擎。`onData` 返回 false 表示流已错位，立刻停。
+    /// 读一侧的字节并喂给引擎。
+    ///
+    /// 每个退出路径都会 `exit.fire(reason)`，原因会进结束日志。这一点很关键：
+    /// 之前只有一句「连接结束」，无法区分「服务器关的」「我们分帧失败的」
+    /// 和「客户端走了」，排查只能靠猜。
     private func pump(_ socket: NetSocket, _ name: String, _ tag: String,
+                      _ exit: ExitSignal,
                       onData: ([UInt8]) -> Bool,
                       onEnd: () -> Void) {
-        defer { noteExit(tag) }
         var buffer = [UInt8](repeating: 0, count: 16384)
+        var total = 0
         while true {
             let count = socket.read(&buffer)
             if count < 0 {
-                if errno == EINTR { continue }
-                // 读超时不能当连接结束。隧道 socket 设的是「不超时」，
-                // 但万一某条路径漏了设置，这里退化成「继续等」而不是
-                // 「把整条连接判死」—— 后者会让对端莫名其妙掉线。
-                if errno == EAGAIN || errno == EWOULDBLOCK { continue }
-                log("[tun] \(name) 读失败（errno \(errno)）")
-                break
+                // errno 必须在 read 返回后立刻取：后面任何一次系统调用或
+                // 内存分配都可能把它覆盖掉。NetSocket.read 内部已保证
+                // 返回前不再有别的系统调用。
+                let code = errno
+                if code == EINTR { continue }
+                if code == EAGAIN || code == EWOULDBLOCK {
+                    // 读超时不该被当成 EOF 把连接判死。隧道 socket 设的是
+                    // 「不超时」，走到这里说明某条路径漏了设置 —— 继续等。
+                    continue
+                }
+                log("[tun] \(name) 读失败（errno \(code)，已读 \(total) 字节）")
+                exit.fire("读失败 errno \(code)")
+                return
             }
             if count == 0 {
-                log("[tun] \(name) 方向 EOF")
+                log("[tun] \(name) 方向 EOF（已读 \(total) 字节）")
+                exit.fire("对端 EOF")
                 onEnd()
-                break
+                return
             }
-            if !onData(Array(buffer[0..<count])) { break }
+            total += count
+            if !onData(Array(buffer[0..<count])) {
+                // 引擎判定这条流不能再用（分帧错位 / 翻译失败）。
+                // 具体原因引擎自己已经记在 lastError 里并被 logEnd 打出。
+                exit.fire("引擎拒绝（流错位）")
+                return
+            }
         }
     }
 }

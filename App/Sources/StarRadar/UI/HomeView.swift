@@ -341,6 +341,18 @@ struct HomeView: View {
 
     // ── 日志 ──────────────────────────────────────────────────
 
+    /// 版本号 + 构建号。
+    ///
+    /// 侧载安装后「手机上装的是哪个包」本来无从确认 —— 而排查「改了为什么
+    /// 没效果」时，这是必须先排除的一项（拿错包、装的是上一版，很容易发生）。
+    /// 所以把它摆在页面上，让用户能直接截图对照。
+    private var versionLine: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "版本 \(version)（build \(build)）"
+    }
+
     private var logCard: some View {
         SrCard {
             HStack {
@@ -353,7 +365,8 @@ struct HomeView: View {
                     .padding(.vertical, 4)
                     .onTapGesture { service.logs.removeAll() }
             }
-            let lines = Array(service.logs.suffix(10))
+            Hint(versionLine).padding(.top, 2)
+            let lines = Array(service.logs.suffix(18))
             if lines.isEmpty {
                 Hint("还没有日志").padding(.top, 6)
             } else {
