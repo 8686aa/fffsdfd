@@ -53,7 +53,14 @@ struct HomeView: View {
         .sheet(isPresented: $showConfig) {
             ConfigView(service: service)
         }
-        .fullScreenCover(isPresented: $showWeb) {
+        .fullScreenCover(isPresented: $showWeb, onDismiss: {
+            // 双保险：onDisappear 和 onAppear 在 fullScreenCover 场景下
+            // 未必都会触发（底层视图不一定真的消失/重现）。方向锁如果在
+            // 这里没收回来，主页就会卡在横屏、卡片被挤成两栏。
+            OrientationLock.portrait()
+            OrientationLock.apply()
+            service.refreshStats()
+        }) {
             if let url = URL(string: webUrl) {
                 BuiltinWebScreen(url: url)
             } else {
@@ -355,9 +362,23 @@ struct HomeView: View {
 
     private var logCard: some View {
         SrCard {
-            HStack {
+            HStack(spacing: 8) {
                 CardTitle(text: "日志")
                 Spacer()
+                // 调试开关。默认关 —— [s5]/[udp]/[tun] 那些流程日志在正常
+                // 使用时只是噪音，而用户看日志是为了判断「现在通不通」。
+                // 排查问题时点一下就能看到（历史记录也都在，不会因为当时
+                // 没开而丢线索）。
+                Text(service.showDebugLogs ? "调试 开" : "调试")
+                    .font(.system(size: 12, weight: service.showDebugLogs
+                                  ? .semibold : .regular))
+                    .foregroundColor(service.showDebugLogs ? Sr.accent : Sr.dim)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .onTapGesture {
+                        service.showDebugLogs.toggle()
+                        service.saveSettings()
+                    }
                 Text("清空")
                     .font(.system(size: 12))
                     .foregroundColor(Sr.dim)
@@ -366,9 +387,14 @@ struct HomeView: View {
                     .onTapGesture { service.logs.removeAll() }
             }
             Hint(versionLine).padding(.top, 2)
-            let lines = Array(service.logs.suffix(18))
+
+            let lines = service.visibleLogs(limit: 18)
             if lines.isEmpty {
-                Hint("还没有日志").padding(.top, 6)
+                let hidden = service.hiddenLogCount
+                Hint(hidden > 0
+                     ? "暂无有效日志（已隐藏 \(hidden) 条调试日志，点上方「调试」查看）"
+                     : "还没有日志")
+                    .padding(.top, 6)
             } else {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
@@ -379,6 +405,11 @@ struct HomeView: View {
                     }
                 }
                 .padding(.top, 6)
+                // 有被隐藏的调试日志时给一句提示，避免用户以为「日志丢了」
+                if !service.showDebugLogs && service.hiddenLogCount > 0 {
+                    Hint("另有 \(service.hiddenLogCount) 条调试日志已隐藏")
+                        .padding(.top, 4)
+                }
             }
         }
     }

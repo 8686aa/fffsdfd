@@ -26,9 +26,23 @@
     <!-- SwiftUI 生命周期；UILaunchScreen 为空字典即可（iOS 14+ 要求） -->
     <key>UILaunchScreen</key>
     <dict/>
+    <!--
+      ⚠️ 这里必须把横屏也列上，即使主页只想竖屏。
+
+      iOS 取「Info.plist 声明的方向」与「application(_:supportedInterface
+      OrientationsFor:) 返回的 mask」的**交集**。只在 delegate 里返回横屏、
+      plist 里不写 landscape，交集仍然是竖屏 —— 内置网页转不过来，而且
+      不会有任何报错或日志，页面就是不动。
+
+      实际的方向控制由 OrientationLock 负责：
+        · 主页 → .portrait
+        · 内置网页 → .allButUpsideDown（战术雷达那种页横屏才有意义）
+    -->
     <key>UISupportedInterfaceOrientations</key>
     <array>
         <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
     </array>
     <key>UISupportedInterfaceOrientations~ipad</key>
     <array>

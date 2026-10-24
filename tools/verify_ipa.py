@@ -147,6 +147,16 @@ def main() -> int:
     ats = info.get('NSAppTransportSecurity') or {}
     report.check('允许明文 HTTP（节点接口是 http）',
                  ats.get('NSAllowsArbitraryLoads') is True)
+    # 方向声明里必须有横屏：否则内置网页的横屏支持会被系统按交集限制回
+    # 竖屏，页面转不过来且没有任何报错（详见 Info.plist 里的注释）。
+    orientations = info.get('UISupportedInterfaceOrientations') or []
+    report.check('声明支持横屏（内置网页要用）',
+                 'UIInterfaceOrientationLandscapeLeft' in orientations
+                 and 'UIInterfaceOrientationLandscapeRight' in orientations,
+                 str(orientations))
+    report.check('声明支持竖屏（主页锁竖屏，但 plist 也要有）',
+                 'UIInterfaceOrientationPortrait' in orientations,
+                 str(orientations))
     report.check('有 UILaunchScreen（否则界面被压成 1/4 屏）',
                  'UILaunchScreen' in info)
 

@@ -13,6 +13,7 @@ final class Settings {
         static let user = "sr.user"
         static let password = "sr.password"
         static let backgroundAudio = "sr.backgroundAudio"
+        static let debugLogs = "sr.debugLogs"
     }
 
     private let defaults: UserDefaults
@@ -26,6 +27,9 @@ final class Settings {
     var password: String
     /// 用静音音频换后台常驻。关掉更省电，但切后台会被系统挂起（iOS 限制）。
     var backgroundAudio: Bool
+    /// 显示调试日志（[s5] / [udp] / [tun] / [ch] 这类流程日志）。
+    /// 默认关闭：正常使用时它们只是噪音；排查问题时再打开。
+    var debugLogs: Bool
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -39,6 +43,8 @@ final class Settings {
         user = defaults.string(forKey: Key.user) ?? ""
         password = defaults.string(forKey: Key.password) ?? ""
         backgroundAudio = defaults.object(forKey: Key.backgroundAudio) as? Bool ?? true
+        // 默认 false：调试日志只在排查时有用，平时是噪音
+        debugLogs = defaults.object(forKey: Key.debugLogs) as? Bool ?? false
     }
 
     var configured: Bool {
@@ -79,6 +85,7 @@ final class Settings {
         defaults.set(user, forKey: Key.user)
         defaults.set(password, forKey: Key.password)
         defaults.set(backgroundAudio, forKey: Key.backgroundAudio)
+        defaults.set(debugLogs, forKey: Key.debugLogs)
     }
 
     /// 过滤模式的显示名。

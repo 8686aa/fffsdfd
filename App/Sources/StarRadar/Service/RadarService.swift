@@ -73,6 +73,18 @@ final class RadarService: ObservableObject {
     // 扫码接入
     @Published var entries: [ShareLinks.Entry] = []
 
+    /**
+     是否显示调试日志。
+
+     默认关：`[s5] UDP 关联已建立`、`[tun] 连接结束（63/65 帧）`、
+     `[ch] 缓存一帧` 这类东西在正常使用时纯属噪音，而用户看日志是为了
+     回答「现在到底通不通」。排查问题时在日志卡里打开这个开关。
+
+     注意：**日志本身一直全量记录**（`logs` 不过滤），只是显示时过滤。
+     所以打开开关能立刻看到之前发生的事，不会因为「当时没开」而丢线索。
+     */
+    @Published var showDebugLogs: Bool = false
+
     @Published var logs: [String] = []
 
     private let settings = Settings()
@@ -139,6 +151,7 @@ final class RadarService: ObservableObject {
         authUser = settings.user
         authPassword = settings.password
         backgroundAudio = settings.backgroundAudio
+        showDebugLogs = settings.debugLogs
         problems = settings.problems()
     }
 
@@ -152,6 +165,7 @@ final class RadarService: ObservableObject {
         settings.user = authUser
         settings.password = authPassword
         settings.backgroundAudio = backgroundAudio
+        settings.debugLogs = showDebugLogs
         settings.save()
         apiKey = settings.apiKey
         problems = settings.problems()
@@ -468,14 +482,70 @@ final class RadarService: ObservableObject {
 
     // ── 日志 ──────────────────────────────────────────────────
 
+    // ── 日志分级 ──────────────────────────────────────────────
+
+    /// 纯流程日志的标签。带这些标签的行默认不显示。
+    private static let debugTags = [
+        "[s5]", "[udp]", "[tun]", "[ch]", "[ka]", "[ws]", "[net]", "[cfg]",
+    ]
+
+    /**
+     这些词一旦出现，即使带调试标签也**保留显示**。
+
+     区别在于「流程」和「结果」：
+       · `[s5] UDP 关联已建立`        → 流程，正常时天天有，隐藏
+       · `[s5] 连不上目标端口 63861`  → 结果，出事了，必须看得见
+
+     否则关掉调试日志后，真正的问题也一起消失了 —— 那比噪音更糟。
+     */
+    private static let keepWords = [
+        // 出了问题
+        "⚠️", "失败", "错误", "连不上", "打不开", "拒绝", "异常", "超时", "不匹配",
+        // 代理的开关状态。这两条虽然也挂在 [s5] 上，但它们是用户最想确认的
+        // 事实（代理到底开没开），绝不能因为「带调试标签」被藏掉。
+        // 注意别加「已就绪」：那条是 `[s5] 已就绪（0.0.0.0:1083）`（监听成功）
+        // 和 `[ka] 静音音频已就绪`（保活流程），都属于纯流程日志。
+        "已开始", "已停止", "没找到",
+    ]
+
+    /// 这一行是不是「纯调试」日志。
+    static func isDebugLine(_ line: String) -> Bool {
+        // 上报状态（[ok] / [err]）是用户能直接感知的状态变化，一律保留
+        if line.contains("[ok]") || line.contains("[err]") { return false }
+        // 出事的信息保留
+        if keepWords.contains(where: { line.contains($0) }) { return false }
+        // 剩下带流程标签的才算调试
+        return debugTags.contains(where: { line.contains($0) })
+    }
+
+    /// 界面要显示的日志（已按开关过滤）。
+    ///
+    /// @param limit 只取最后几条 —— 日志卡高度有限，滚动成本高于信息量。
+    func visibleLogs(limit: Int) -> [String] {
+        let source = showDebugLogs
+            ? logs
+            : logs.filter { !RadarService.isDebugLine($0) }
+        return Array(source.suffix(limit))
+    }
+
+    /// 当前被隐藏的调试日志条数（用来在开关旁提示「还有 N 条」）。
+    var hiddenLogCount: Int {
+        guard !showDebugLogs else { return 0 }
+        return logs.reduce(into: 0) { count, line in
+            if RadarService.isDebugLine(line) { count += 1 }
+        }
+    }
+
     func appendLog(_ text: String) {
         let stamp = RadarService.clock()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.logSeq += 1
             self.logs.append("\(stamp) \(text)")
-            if self.logs.count > 200 {
-                self.logs.removeFirst(self.logs.count - 200)
+            // 上限放宽到 400：调试日志也全量留着，打开开关时能回看，
+            // 但又不至于无限增长。400 条短字符串的内存可忽略。
+            if self.logs.count > 400 {
+                self.logs.removeFirst(self.logs.count - 400)
             }
         }
     }
