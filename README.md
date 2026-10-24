@@ -132,46 +132,79 @@ TrollStore 等）安装；企业签名/自签证书的流程不在本仓库范�
 
 ## 验证情况
 
-已在本仓库内可复现：
+### 已经在 CI 上跑通的（就是证据，不是预计）
 
-- **协议向量**：`minimal_be` / `dh`（含 512 位模幂）/ `pad_len` / `strip` /
-  `translate` / `pack` / `framer` / `framer_partial` / `replace_dh` /
-  `secure_ws`（HKDF、roomId、transcript）/ `envelope`（GCM 逐字节）/ `batch`
-- **扫码链接**：percent 编码 / 三种客户端链接 / 订阅 / `.conf` / UDP 封装
-- **AES**：FIPS-197 已知答案 + S-box 定点值
-- **UDP 过滤**：系统端口、媒体端口、双向判据、大流量放行、单向判死
+Run #40086825246：
 
-**未在本机验证**（Windows 上没有 Xcode，也没有真机）：
+```
+Core vector tests   success      ← 与 PC/Android 共用同一批向量
+unsigned ipa        success
+  show Xcode versions / select Xcode / install xcodegen / generate project
+  build (no signing) / package ipa / upload artifact   ← 全部 ok
+```
 
-- 实际编译通过性（由 CI 的 macOS runner 保证）
-- 真机上的局域网授权、SOCKS5 连通性、游戏内实际抓取
-- 后台静音音频是否被系统持续允许（依赖机型与省电策略）
+产物 `StarRadar-unsigned.ipa`（434 KB artifact，解包后 448 KB）：
 
-第一次真机跑建议按这个顺序看：节点自检 → 另一台设备连接 → 界面「连接/活跃」
-是否上涨 → 「对局参数」是否出现。
+| 检查 | 结果 |
+|---|---|
+| 结构 | `Payload/StarRadar.app/`，无多余层级 |
+| 显示名 | `APP` |
+| bundle id | `com.starradar.ios`（`$(...)` 已展开） |
+| 版本 | 1.0.0 (1) |
+| 后台模式 | `audio` |
+| 局域网授权描述 | 有 |
+| ATS | `NSAllowsArbitraryLoads = true` |
+| 可执行文件 | 1.53 MB，arm64 单架构，`MH_MAGIC_64` |
+| 平台 / 最低系统 | iOS / 15.0（SDK 26.2） |
+| 签名 | **无** `_CodeSignature`、无 `embedded.mobileprovision` |
+
+本地复验：
+
+```bash
+python3 tools/verify_ipa.py artifacts/StarRadar-unsigned.ipa
+# 22 项通过，0 项失败
+```
+
+### 还没验证的（必须真机）
+
+- 首次启动的「本地网络」授权弹窗
+- 另一台设备经 SOCKS5 实际联网、进游戏
+- 静音音频在息屏后是否被系统杀掉（依机型与省电策略）
+- 对局端口 65010 的帧翻译在真实会话里是否稳定
 
 ---
 
-## 推送到你自己的仓库
+## 踩过的坑（都写在代码注释里了）
 
-本目录已经是一个初始化好的 git 仓库（含一次提交），但**没有任何远程地址**，
-也没有可用的推送凭据（`ssh -T git@github.com` 返回 `Permission denied (publickey)`）。
-补上远程即可：
+出 ipa 这条链路一共失败 6 次，每次都是具体问题，记下来省得重踩：
 
-```bash
-cd starradar-ios
-git remote add origin git@github.com:<你的账号>/<仓库名>.git
-git branch -M main
-git push -u origin main
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | `AES.GCM` 找不到 | 本模块自己定义了 `AES`（AES-CBC），与 `CryptoKit.AES` 撞名 | 全限定 `CryptoKit.AES.GCM` |
+| 2 | `>=` 不可用 | `BigUInt` 只写了 `<` `>` `==`，没遵循 `Comparable` | 声明 `: Comparable` |
+| 3 | switch 不穷尽 | `switch State?` 时穷尽性按 `State` 全部 case 算 | 补 `case .hold, nil` |
+| 4 | 测试崩 `unexpectedly found nil` | `envelope.firstPlaintext_utf8` 与 `first` **同级**，被当成子键 | 改取值路径 |
+| 5 | `Unable to read project ... format (77)` | XcodeGen 出 objectVersion 77，macos-14 是 Xcode 15.4（只到 60） | ipa job 换 `macos-15` |
+| 6 | `overlapping accesses to 'buffer'` | `withUnsafeMutableBytes` 闭包里读了 `buffer.count` | 容量在闭包外取好 |
+
+另外两个不是「编译错误」但更值得记的：
+
+- **`BigUInt.multiply` 的最终归约丢了 `t[size]`**。CIOS 结束时真实值是
+  `t[size]·2^(32·size) + 低 size 位`，可能落在 `[n, 2n)`。漏掉这行**不会在
+  P（512 位素数）上必现** —— 某些中间值恰好让 `t[size]=0`，于是「大部分对、
+  偶发算错」。我用 Python 逐行复现该算法才抓到：修正前 16~512 位随机奇数模数
+  24 例错 9 例，修正后 16~1024 位 40 例全过。
+- **`binaryModPow` 里用加法当乘方**（`addMod(r, r)` 算的是 `2r` 不是 `r²`）。
+  它是「偶数模数」的兜底路径，而 P 是奇数所以从未触发 —— 这种「静默错路」
+  比直接崩更危险，已删掉，改成 `precondition` 要求奇数模数。
+
+---
+
+## 关于 token
+
+推送用 Personal Access Token 走 API（`scripts/push_via_api.py`）。
+推送完成后应当**立刻撤销**这个 token：
+
 ```
-
-推送后 GitHub Actions 会自动跑：
-
-- `Core 向量测试`（`swift test`，与 PC/Android 对同一批向量）
-- `无签名 ipa`（`xcodegen` + `xcodebuild` + 打包 `Payload/`）
-
-产物在 Actions 运行页面的 **Artifacts → StarRadar-unsigned-ipa**。
-需要登录 GitHub 才能下载，这也意味着仓库可以是私有的。
-
-想先在本地验证再推：`git bundle create starradar-ios.bundle --all`，
-把 `.bundle` 拷到有 Xcode 的机器上 `git clone starradar-ios.bundle`。
+https://github.com/settings/tokens → 找到对应条目 → Delete
+```
