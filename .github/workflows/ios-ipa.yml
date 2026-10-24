@@ -1,0 +1,83 @@
+name: build-unsigned-ipa
+
+# 为什么必须在这里构建：
+#   打 ipa 需要 Xcode（只能跑在 macOS 上）。仓库里没有任何证书/描述文件，
+#   所以整体走「无签名」路径 —— 产物 .ipa 需要用 AltStore / Sideloadly /
+#   TrollStore 之类工具侧载安装，不能直接双击装。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 先跑协议层的交叉验证：与 PC/Android 共用同一批向量，
+  # 这一步红了就没必要出包。
+  core-tests:
+    name: Core vector tests
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: Core
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift version
+        run: swift --version
+      - name: run tests
+        run: swift test
+
+  ipa:
+    name: unsigned ipa
+    needs: core-tests
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: install xcodegen
+        run: brew install xcodegen
+
+      - name: generate project
+        run: xcodegen generate
+
+      - name: build (no signing)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project StarRadar.xcodeproj \
+            -scheme StarRadar \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: package ipa
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release-iphoneos/StarRadar.app"
+          if [ ! -d "$APP" ]; then
+            echo "missing $APP"
+            find build/Build/Products -maxdepth 3 -name '*.app' || true
+            exit 1
+          fi
+          rm -rf Payload StarRadar-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry StarRadar-unsigned.ipa Payload
+          ls -lh StarRadar-unsigned.ipa
+          unzip -l StarRadar-unsigned.ipa | head -20
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StarRadar-unsigned-ipa
+          path: StarRadar-unsigned.ipa
+          if-no-files-found: error

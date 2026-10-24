@@ -1,0 +1,15 @@
+# Xcode / SwiftPM
+build/
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+
+# 产物
+*.ipa
+Payload/
+StarRadar.xcodeproj/
+
+# 系统
+.DS_Store
