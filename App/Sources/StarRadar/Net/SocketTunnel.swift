@@ -35,6 +35,10 @@ public final class SocketTunnel {
     private let clientLock = NSLock()
     private let upstreamLock = NSLock()
 
+    /// 记录哪个方向先退出（两个 pump 线程都会写）。
+    private let exitLock = NSLock()
+    private var exitTag: String?
+
     public init(client: NetSocket, upstream: NetSocket,
                 sessionInfo: @escaping () -> (String, Int),
                 onKey: @escaping (KeyMaterial) -> Void,
@@ -84,9 +88,11 @@ public final class SocketTunnel {
         sink.owner = self
         engine.sink = sink
 
+        let started = Date()
+
         let c2s = Thread { [weak self] in
             guard let self else { return }
-            self.pump(self.client, "client",
+            self.pump(self.client, "客户端→服务器", "c2s",
                       onData: { engine.feedC2s($0) },
                       onEnd: { self.upstream.shutdownWrite() })
         }
@@ -95,7 +101,7 @@ public final class SocketTunnel {
 
         let s2c = Thread { [weak self] in
             guard let self else { return }
-            self.pump(self.upstream, "server",
+            self.pump(self.upstream, "服务器→客户端", "s2c",
                       onData: { engine.feedS2c($0) },
                       onEnd: { self.client.shutdownWrite() })
         }
@@ -108,26 +114,54 @@ public final class SocketTunnel {
         // 等**任一方向**结束，不能只等 c2s：服务器主动关连接很常见
         // （HTTP 短连接、游戏踢人、目标端口不存在时的 RST），那种情况下
         // c2s 还在安静地等客户端，而客户端可能永远不发也不关。
+        //
+        // ⚠️ 这里的语义是「不限时等结束，再给另一方 3 秒收尾」。
+        // 曾经写成「最多等 3 秒就无条件收尾」，等于给每条连接设了 3 秒寿命
+        // —— 另一台设备表现为「连上就断」，日志里帧数永远停在 60 上下。
         ThreadJoin.either(c2s, s2c, graceMs: SocketTunnel.halfCloseGraceMs) {
-            self.client.close()
-            self.upstream.close()
+            // 只有「一方结束后另一方仍卡着」才会走到这里。先 shutdown 再
+            // close：close 唤不醒另一个线程里阻塞的 read。
+            log("[tun] 半关闭宽限到期，强制断开（先退出：\(self.firstExit ?? "?")）")
+            self.client.shutdownBoth()
+            self.upstream.shutdownBoth()
         }
         client.close()
         upstream.close()
 
         let stats = engine.snapshot()
-        log("[tun] 连接结束（\(stats["framesC2s"] ?? 0)/\(stats["framesS2c"] ?? 0) 帧）")
+        let seconds = String(format: "%.1f", Date().timeIntervalSince(started))
+        log("[tun] 连接结束（\(stats["framesC2s"] ?? 0)/\(stats["framesS2c"] ?? 0) 帧"
+            + "，持续 \(seconds)s，先退出：\(firstExit ?? "同时")）")
+    }
+
+    /// 哪个方向先结束。排查「连接为什么断」时这是最关键的一条信息。
+    private var firstExit: String? {
+        exitLock.lock()
+        defer { exitLock.unlock() }
+        return exitTag
+    }
+
+    private func noteExit(_ tag: String) {
+        exitLock.lock()
+        if exitTag == nil { exitTag = tag }
+        exitLock.unlock()
     }
 
     /// 读一侧的字节并喂给引擎。`onData` 返回 false 表示流已错位，立刻停。
-    private func pump(_ socket: NetSocket, _ name: String,
+    private func pump(_ socket: NetSocket, _ name: String, _ tag: String,
                       onData: ([UInt8]) -> Bool,
                       onEnd: () -> Void) {
+        defer { noteExit(tag) }
         var buffer = [UInt8](repeating: 0, count: 16384)
         while true {
             let count = socket.read(&buffer)
             if count < 0 {
                 if errno == EINTR { continue }
+                // 读超时不能当连接结束。隧道 socket 设的是「不超时」，
+                // 但万一某条路径漏了设置，这里退化成「继续等」而不是
+                // 「把整条连接判死」—— 后者会让对端莫名其妙掉线。
+                if errno == EAGAIN || errno == EWOULDBLOCK { continue }
+                log("[tun] \(name) 读失败（errno \(errno)）")
                 break
             }
             if count == 0 {

@@ -194,6 +194,16 @@ public final class NetSocket {
         _ = Darwin.shutdown(fd, SHUT_WR)
     }
 
+    /// 双向 shutdown。用来**唤醒另一个线程里阻塞着的 `read`**。
+    ///
+    /// `close(fd)` 做不到这件事：POSIX 规定一个 fd 在被别的线程 read 时
+    /// close，行为是未定义的 —— macOS 上常见的结果是那个 read 一直不返回
+    /// （内核还持有 file description 的引用），于是线程永远退不出去。
+    /// `shutdown(SHUT_RDWR)` 则保证阻塞的 read 立刻返回 0（EOF）。
+    public func shutdownBoth() {
+        _ = Darwin.shutdown(fd, SHUT_RDWR)
+    }
+
     public func close() {
         if fd >= 0 {
             Darwin.close(fd)

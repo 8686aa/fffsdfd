@@ -165,7 +165,12 @@ public final class UdpRelay {
             guard let parsed = Socks5Proto.parseUdp(data), parsed.port != 0 else {
                 continue
             }
+            // 回包地址要发给「谁申请的这个 relay」。upstreamLoop 会在别的
+            // 线程上读它，所以写入必须持锁 —— 不锁的话读到半个 sockaddr_in
+            // 会把回包发到错误的端口（客户端表现为「UDP 有去无回」）。
+            lock.lock()
             clientAddress = from
+            lock.unlock()
 
             guard let targetIp = resolve(parsed.host) else { continue }
 

@@ -73,6 +73,17 @@ final class RadarService: ObservableObject {
     private var uploader: Uploader?
     private var keepAlive: KeepAlive?
     private let gate = UdpGate()
+
+    // UDP 包计数先攒在普通变量里，由 0.5s 的刷新定时器一次取走。
+    //
+    // 之前是「每个 UDP 包一次 DispatchQueue.main.async」—— 对局期间 UDP
+    // 每秒几百上千个（含 QUIC / DNS），主线程会被这些 block 淹没，
+    // 表现为界面卡死、日志延迟，连带刷新定时器都跑不动。
+    // 计数器不是业务数据（精确到 0.5 秒足够看趋势），没必要每包都上主线程。
+    private let statLock = NSLock()
+    private var pendingUdpUp: Int64 = 0
+    private var pendingUdpDown: Int64 = 0
+
     private var refreshTimer: Timer?
     private var logSeq = 0
 
@@ -277,14 +288,13 @@ final class RadarService: ObservableObject {
             up: flow.up, payload: payload))
         if ready.isEmpty { return }
 
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if up {
-                self.udpUp += Int64(ready.count)
-            } else {
-                self.udpDown += Int64(ready.count)
-            }
+        statLock.lock()
+        if up {
+            pendingUdpUp += Int64(ready.count)
+        } else {
+            pendingUdpDown += Int64(ready.count)
         }
+        statLock.unlock()
 
         for item in ready {
             let reported = UdpReport.Flow(clientIp: item.clientIp,
@@ -344,6 +354,16 @@ final class RadarService: ObservableObject {
 
     func refreshStats() {
         guard let server else { return }
+
+        statLock.lock()
+        let up = pendingUdpUp
+        let down = pendingUdpDown
+        pendingUdpUp = 0
+        pendingUdpDown = 0
+        statLock.unlock()
+        if up > 0 { udpUp += up }
+        if down > 0 { udpDown += down }
+
         connects = server.connects
         active = server.active
         let (threads, queued) = server.workerStats()

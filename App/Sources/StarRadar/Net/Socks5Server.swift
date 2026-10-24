@@ -353,9 +353,15 @@ public final class Socks5Server {
         b.stackSize = 256 * 1024
         a.start()
         b.start()
+        // ⚠️ 这里的语义是「不限时等某个方向结束，再给另一个 3 秒收尾」。
+        // 曾经写成「最多等 3 秒就无条件关」—— 那等于给每条转发连接设了
+        // 3 秒寿命，另一台设备的网页、API 全部打不开（表现为整个断网，
+        // 而不只是某个游戏掉线）。
         ThreadJoin.either(a, b, graceMs: Socks5Server.halfCloseGraceMs) {
-            client.close()
-            upstream.close()
+            // 只有「一方结束后另一方仍卡着」才会走到这里。
+            // 先 shutdown 再 close：close 唤不醒另一个线程里阻塞的 read。
+            client.shutdownBoth()
+            upstream.shutdownBoth()
         }
         client.close()
         upstream.close()
@@ -368,6 +374,8 @@ public final class Socks5Server {
             let count = from.read(&buffer)
             if count < 0 {
                 if errno == EINTR { continue }
+                // 读超时不能当连接结束（见 SocketTunnel.pump 的同类注释）
+                if errno == EAGAIN || errno == EWOULDBLOCK { continue }
                 break
             }
             if count == 0 { break }
