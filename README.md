@@ -208,3 +208,51 @@ python3 tools/verify_ipa.py artifacts/StarRadar-unsigned.ipa
 ```
 https://github.com/settings/tokens → 找到对应条目 → Delete
 ```
+
+---
+
+## 后台运行（iOS 的硬限制与应对）
+
+Android 能拿 WakeLock + WifiLock 常驻，iOS **没有**对等能力。App 进后台约
+30 秒后会被系统挂起，socket 随之停摆 —— 表现就是「另一台设备连着但没网」。
+
+唯一可行的手段是**音频后台模式**：`UIBackgroundModes: audio` + 一直播放
+一路静音音频，让进程处于「正在后台播放」状态。侧载分发不受 App Store 审核
+约束，所以这条路可用；设置里给了开关（关掉更省电，但切后台即断）。
+
+### 光「播一次静音」是不够的
+
+这路音频很容易被打断，而且打断后不会自己回来。`KeepAlive` 现在处理这些：
+
+| 打断来源 | 处理 |
+|---|---|
+| 来电 / 闹钟 / 视频通话 | 监听 `interruptionNotification`，`.ended` 且 `.shouldResume` 就重建 |
+| 拔耳机 / 蓝牙断开 | 监听 `routeChangeNotification`，`.oldDeviceUnavailable` 就重建 |
+| 媒体服务被系统重启 | 监听 `mediaServicesWereResetNotification`，重建 |
+| 播放器异常停止 | 5 秒一次的看门狗检查 `isPlaying`，停了就重建 |
+| 混音会话不被系统重视 | 反复掉线 2 次后自动升级为**独占**音频会话 |
+
+两个容易踩的点：
+
+- **静音必须靠采样值（全零 16 位 PCM），不能 `volume = 0`**。音量设 0 会让
+  系统认为这路音频「没有实际输出」，后台优先级被降掉，照样被挂起。
+- **要登记 now-playing**（`MPNowPlayingInfoCenter` + `beginReceivingRemoteControlEvents`）。
+  只 `play()` 而不登记时，很多机型把本 App 当普通 App 挂起。登记后锁屏上会
+  出现一张「代理运行中」的卡片 —— 这既是代价也是收益，用户能直接看到在跑。
+
+### 还是被挂起了怎么办
+
+会检测出来并自救：看门狗在后台每 5 秒一跳，如果某一跳与上一跳间隔超过 12 秒，
+说明 App 真的被挂起过。这时：
+
+- 挂起 < 60 秒：连接保留（挂起期间内核仍在缓冲数据，恢复后能继续读）
+- 挂起 ≥ 60 秒：主动断开旧连接，让客户端立刻重连（否则它会对着静默连接
+  干等 TCP 重传超时，几分钟才恢复）
+
+界面上会显示「曾检测到系统挂起 App 约 N 秒」，日志里是 `[ka]` 开头。
+
+### 仍然无解的部分
+
+- **从多任务界面划掉 App**：进程直接没了，任何保活都无效。
+- **低电量模式**：系统会明显更积极回收后台 App，界面会给出黄色提示。
+- **长时间后台（数小时）**：个别机型仍会回收。这是平台行为，不是代码问题。

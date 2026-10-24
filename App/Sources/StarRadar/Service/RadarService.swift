@@ -53,6 +53,14 @@ final class RadarService: ObservableObject {
     @Published var uplinkQueued = 0
     @Published var uplinkSent: Int64 = 0
 
+    // 后台/挂起状态。iOS 断网的现场判据全在这几个字段里：
+    //   · inBackground       —— 现在是不是在后台（后台靠静音音频吊着）
+    //   · suspendedSeconds   —— 上次被系统挂起了多久（>0 表示保活失效过）
+    //   · lowPowerMode       —— 低电量模式下系统更激进地挂起后台 App
+    @Published var inBackground = false
+    @Published var suspendedSeconds = 0
+    @Published var lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
+
     // 诊断
     @Published var keepAliveSummary = ""
     @Published var egressLevel = ""
@@ -87,8 +95,37 @@ final class RadarService: ObservableObject {
     private var refreshTimer: Timer?
     private var logSeq = 0
 
+    private var observers: [NSObjectProtocol] = []
+
     init() {
         loadSettings()
+        observeAppLifecycle()
+    }
+
+    /// 观察前后台切换与低电量模式。
+    ///
+    /// 这两件事直接决定「另一台设备会不会断网」，所以要在界面上有可见状态：
+    /// 用户报「切后台就断」时，第一句话该问的是「界面上保活那一行写的是什么」。
+    private func observeAppLifecycle() {
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.inBackground = true
+        })
+        observers.append(center.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.inBackground = false
+        })
+        observers.append(center.addObserver(
+            forName: .NSProcessInfoPowerStateDidChange,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
+        })
     }
 
     // ── 配置 ──────────────────────────────────────────────────
@@ -174,6 +211,29 @@ final class RadarService: ObservableObject {
 
         // 保活（先拿锁再对外「已开始」，否则头几秒仍会被挂起）
         let keeper = KeepAlive(audioEnabled: backgroundAudio)
+        keeper.onLog = { [weak self] text in self?.appendLog(text) }
+        // 系统真的挂起过 → 把已经没人读的旧连接清掉。
+        //
+        // 这一步是「切后台后回来」体感的关键：挂起期间监听 socket 由内核
+        // 维持，但已建立的客户端连接上没有任何人在读，客户端会对着一条
+        // 静默连接干等 TCP 超时（几分钟）。主动断开让它立刻重连。
+        keeper.onSuspended = { [weak self] seconds in
+            guard let self else { return }
+            self.suspendedSeconds = seconds
+            // 短暂挂起**不能**断连接。
+            //
+            // 挂起期间内核仍然持有这些 socket，收到的数据会缓存在接收缓冲里，
+            // 恢复后照样能读出来 —— 一条活着的 TCP 连接撑几十秒没问题。
+            // 只有挂得足够久、客户端大概率已经超时重连了，清掉才是有益的
+            // （让它立刻收到 RST 去重连，而不是干等几分钟）。
+            let reason = "系统挂起 \(seconds)s"
+            if seconds >= RadarService.staleAfterSuspendedSeconds {
+                let dropped = self.server?.dropStaleClients(reason: reason) ?? 0
+                self.appendLog("[ka] 挂起 \(seconds) 秒，已断开 \(dropped) 条旧连接等客户端重连")
+            } else {
+                self.appendLog("[ka] 挂起 \(seconds) 秒后恢复，连接保留")
+            }
+        }
         keepAliveSummary = keeper.acquire()
         keepAlive = keeper
 
@@ -261,6 +321,7 @@ final class RadarService: ObservableObject {
         keepAlive?.release()
         keepAlive = nil
         keepAliveSummary = ""
+        suspendedSeconds = 0
         running = false
         boundSocksPort = 0
         boundHttpPort = 0
@@ -328,6 +389,10 @@ final class RadarService: ObservableObject {
         appendLog("[ch] 已获取对局参数（\(material.id)）")
     }
 
+    /// 挂起超过这个秒数才清理旧连接。低于它认为连接还活着（内核在挂起期间
+    /// 仍会缓冲收到的数据，恢复后可以继续读）。
+    static let staleAfterSuspendedSeconds = 60
+
     /// 上报用的「设备代次」，取机型标识前 16 位（与 Android 取 fingerprint
     /// 前 16 位等价）。节点侧用它区分同一口令下的不同采集端。
     static func deviceTag() -> String {
@@ -373,6 +438,9 @@ final class RadarService: ObservableObject {
             uplinkState = reporter.state
             uplinkQueued = reporter.queued
             uplinkSent = reporter.sent
+        }
+        if let keeper = keepAlive {
+            keepAliveSummary = keeper.summary
         }
         let filter = gate.snapshot()
         if filter.passed + filter.dropped > 0 {
@@ -452,5 +520,10 @@ final class RadarService: ObservableObject {
     /// 多半返回空。所以不看「配了 IP」就放行 —— 那只会让用户点进去看白屏。
     var webReady: Bool {
         running && uplinkState == Uploader.stateConnected
+    }
+
+    deinit {
+        let center = NotificationCenter.default
+        for token in observers { center.removeObserver(token) }
     }
 }

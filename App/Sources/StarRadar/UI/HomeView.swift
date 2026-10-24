@@ -259,7 +259,26 @@ struct HomeView: View {
             }
             if !service.keepAliveSummary.isEmpty {
                 Hint(service.keepAliveSummary,
-                     tone: service.keepAliveSummary.contains("部分") ? .warn : .ok)
+                     tone: service.keepAliveSummary.contains("已启用") ? .ok : .warn)
+                    .padding(.top, 6)
+            }
+            // 后台/挂起状态。iOS 上「另一台设备断网」几乎总是这两件事之一：
+            //   ① 静音音频被打断后没恢复 → 系统挂起 App
+            //   ② 已经在后台且处于低电量模式 → 系统更激进地回收
+            // 所以这里把它们摆到明面上，用户报问题时一眼能看到原因。
+            if service.running && service.inBackground {
+                Hint("App 在后台：正在用静音音频保持运行。"
+                     + "若另一台设备断网，回到前台即可恢复", tone: .normal)
+                    .padding(.top, 6)
+            }
+            if service.running && service.lowPowerMode {
+                Hint("低电量模式已开启：系统会更积极地挂起后台 App，"
+                     + "建议关掉它再开代理", tone: .warn)
+                    .padding(.top, 6)
+            }
+            if service.suspendedSeconds > 0 {
+                Hint("曾检测到系统挂起 App 约 \(service.suspendedSeconds) 秒，"
+                     + "已自动清理僵死连接并恢复音频", tone: .warn)
                     .padding(.top, 6)
             }
             if !service.filterSummary.isEmpty {

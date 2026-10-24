@@ -446,6 +446,33 @@ public final class Socks5Server {
 
     // ── 诊断 ─────────────────────────────────────────────────
 
+    /// 清掉所有已建立的连接，让客户端重新连。
+    ///
+    /// 用在「App 曾被系统挂起」之后：挂起期间没有人读这些 socket，客户端那边
+    /// 看到的是一条**还活着但没有任何响应**的连接 —— 它不会立刻重连，而是要
+    /// 等 TCP 重传超时（几分钟）。主动 shutdown 能让客户端立刻收到 RST、
+    /// 马上重新发起 CONNECT，体感上是「卡一下就好了」而不是「一直没网」。
+    ///
+    /// 用 shutdown 而不是 close：阻塞在 read 上的隧道线程要靠 SHUT_RDWR
+    /// 才能立刻返回，光 close 不保证唤醒。
+    @discardableResult
+    public func dropStaleClients(reason: String) -> Int {
+        lock.lock()
+        let all = clients
+        clients.removeAll()
+        let allRelays = relays
+        relays.removeAll()
+        lock.unlock()
+
+        for (_, socket) in all { socket.shutdownBoth() }
+        for relay in allRelays { relay.close() }
+
+        if !all.isEmpty {
+            log("[s5] 已断开 \(all.count) 条僵死连接（\(reason)），等客户端重连")
+        }
+        return all.count
+    }
+
     /// (当前连接数, 排队数)。iOS 是一条连接一个线程，队列恒为 0；
     /// 保留这个形状是为了与 Android 端界面一致，便于对照排查。
     public func workerStats() -> (Int, Int) {
