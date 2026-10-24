@@ -213,38 +213,19 @@ public struct BigUInt: Comparable {
 
     /// `self^exponent mod modulus`。
     ///
-    /// 模数必须是**奇数**（TGCP 的 P 是素数，满足）。非奇数时 Montgomery
-    /// 不成立，这里退回逐位二进制方法，保证不会静默算错。
+    /// 只支持**奇数**模数 —— TGCP 的 P 是素数，恒满足。偶数模数下
+    /// Montgomery 不成立，这里直接 precondition 失败，而不是悄悄算错：
+    /// 曾经写过一条「偶数时退回二进制方法」的兜底路径，结果那条路径里
+    /// 用加法当乘方（`addMod(result, result)` 算的是 2·result 而不是
+    /// result²），只因为 P 是奇数才一直没被触发。留着这种分支比删掉更危险。
     public func modPow(_ exponent: BigUInt, _ modulus: BigUInt) -> BigUInt {
         if modulus.limbs.isEmpty { return BigUInt(0) }
-        if modulus.limbs[0] & 1 == 0 {
-            return binaryModPow(exponent, modulus)
-        }
+        precondition(modulus.limbs[0] & 1 == 1,
+                     "modPow 只支持奇数模数（TGCP 的 P 是素数，恒满足）")
         let context = Montgomery(modulus: modulus)
         return context.modPow(base: self, exponent: exponent)
     }
 
-    /// 二进制平方-乘（只用于偶数模数的兜底路径）。每次模乘都是逐位加法。
-    private func binaryModPow(_ exponent: BigUInt, _ modulus: BigUInt) -> BigUInt {
-        var base = self
-        while BigUInt.compare(base, modulus) >= 0 { base = base - modulus }
-        var result = BigUInt(1)
-        var bitIndex = exponent.bitCount - 1
-        while bitIndex >= 0 {
-            result = Self.addMod(result, result, modulus)
-            if exponent.bit(bitIndex) {
-                result = Self.addMod(result, base, modulus)
-            }
-            bitIndex -= 1
-        }
-        return result
-    }
-
-    /// `a + b mod n`，要求 a、b < n。
-    static func addMod(_ a: BigUInt, _ b: BigUInt, _ n: BigUInt) -> BigUInt {
-        let sum = a + b
-        return BigUInt.compare(sum, n) >= 0 ? sum - n : sum
-    }
 }
 
 /// Montgomery 上下文：把「乘 + 取模」变成移位与加法。
@@ -263,14 +244,15 @@ struct Montgomery {
         self.size = limbs.count
         self.n0inv = Self.inverse32(limbs[0])
 
-        // R 与 R² 都用「反复翻倍」算，避免引入除法
-        var one = [UInt32](repeating: 0, count: size)
-        one[0] = 1
-        var r = one
-        for _ in 0..<(32 * size) { r = Self.double(r, limbs) }
-        var square = r
-        for _ in 0..<(32 * size) { square = Self.double(square, limbs) }
-        self.r2 = square
+        // R² 用「反复翻倍」算两次，避免引入除法：
+        //   1 → 翻倍 32·size 次得到 R = 2^(32·size) mod n
+        //   R → 再翻倍 32·size 次得到 R² = 2^(64·size) mod n
+        // double() 里对进位溢出的处理与 multiply 的最终归约是同一个道理。
+        var value = [UInt32](repeating: 0, count: size)
+        value[0] = 1
+        for _ in 0..<(32 * size) { value = Self.double(value, limbs) }
+        for _ in 0..<(32 * size) { value = Self.double(value, limbs) }
+        self.r2 = value
     }
 
     /// `n0⁻¹ mod 2³²` 的 Newton 迭代（5 轮收敛到 32 位）。
@@ -356,22 +338,21 @@ struct Montgomery {
             t[size + 1] = 0
         }
 
+        // ★ 归约必须看 t[size]。
+        //
+        // CIOS 结束时结果的真实值是 `t[size]·2^(32·size) + 低 size 位`，
+        // 可能落在 [n, 2n)。只比较低 size 位是不够的：t[size] == 1 时
+        // 真实值必然 ≥ 2^(32·size) > n，必须减一次 n，而减去时产生的
+        // 借位正好抵消掉那个 2^(32·size)。
+        //
+        // 漏掉这一条不会在 P（512 位素数）上必现 —— 某些中间值恰好
+        // 让 t[size] 保持 0，于是「大部分正确、偶发算错」。实测在 16~512 位
+        // 的随机奇数模数上有 9/24 算错，而 P 恰好通过，属于最难查的一类。
         var result = Array(t[0..<size])
-        while result.count > size { result.removeLast() }
-        if Self.compare(result, modulus) >= 0 {
+        if t[size] != 0 || Self.compare(result, modulus) >= 0 {
             result = Self.subtract(result, modulus)
         }
-        while let last = result.last, last == 0, result.count > size {
-            result.removeLast()
-        }
         return result
-    }
-
-    /// 转进 Montgomery 域：`value·R mod n`。
-    private func toDomain(_ value: BigUInt) -> [UInt32] {
-        var limbs = value.limbs
-        while limbs.count < size { limbs.append(0) }
-        return multiply(limbs, r2)
     }
 
     /// 转出 Montgomery 域：`value·R⁻¹ mod n`。

@@ -80,8 +80,14 @@ final class SecureWsVectorTests: XCTestCase {
     func testEnvelopeCiphertextIsByteIdentical() throws {
         let (keys, _) = session()
         let envelope = vectors["envelope"]!
+
+        // ⚠️ `firstPlaintext_utf8` 是与 `first` **同级**的字段，不是 first 的子字段。
+        // 之前写成 `first["firstPlaintext_utf8"]` 于是在 CI 上强制解包 nil 崩掉
+        // （编译期看不出来，只有跑测试才炸）。
         let first = envelope["first"]!
-        let plaintext = first["firstPlaintext_utf8"]!.stringValue!
+        guard let plaintext = envelope["firstPlaintext_utf8"]?.stringValue else {
+            return XCTFail("向量缺 firstPlaintext_utf8")
+        }
 
         let channel = SecureWs.Channel(keys: keys, outboundDir: SecureWs.dirC2S)
         let text = try channel.encrypt(Array(plaintext.utf8))
@@ -90,12 +96,18 @@ final class SecureWsVectorTests: XCTestCase {
         XCTAssertEqual(doc["d"]?.stringValue, first["d"]?.stringValue,
                        "同一 key/iv/seq 下 GCM 密文应当逐字节相同")
 
-        // 第二条：seq 自增
+        // 第二条只断言 seq 自增。
+        //
+        // 不能拿 first 的明文再加密一次去比 `second.d`：向量里 second 的
+        // 明文只有 6 字节（密文 22 字节 − 16 字节 tag），与 first 的 31 字节
+        // 不同 —— 那是生成向量时用的一段独立测试串，内容没写进 JSON。
         let second = envelope["second"]!
         let secondText = try channel.encrypt(Array(plaintext.utf8))
         let secondDoc = Json.parse(secondText)!
-        XCTAssertEqual(secondDoc["seq"]?.intValue, second["seq"]?.intValue)
-        XCTAssertEqual(secondDoc["d"]?.stringValue, second["d"]?.stringValue)
+        XCTAssertEqual(secondDoc["seq"]?.intValue, second["seq"]?.intValue,
+                       "seq 必须自增到 2")
+        XCTAssertFalse(second["d"]?.stringValue.isEmpty ?? true,
+                       "向量里的 second.d 不该为空")
     }
 
     func testDecryptsServerFrameFromPython() throws {

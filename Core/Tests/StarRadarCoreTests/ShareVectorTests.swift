@@ -51,9 +51,39 @@ final class ShareVectorTests: XCTestCase {
             XCTAssertEqual(ShareLinks.subscriptionPlain(target, flavor: "mixed"),
                            value["sub_plain_mixed"]?.stringValue,
                            "[\(flavor)] 混合明文订阅不一致")
-            XCTAssertEqual(ShareLinks.shadowrocketConf(target),
+            // ⚠️ 向量里的 conf 是用 `shadowrocket_conf_with_proxy` 生成的
+            // （带 [Proxy Group] 段、FINAL 指向 PROXY）。拿不带组的那份比
+            // 会稳定失败 —— 这是对照生成脚本确认过的，不是猜的。
+            XCTAssertEqual(ShareLinks.shadowrocketConfWithProxy(target),
                            value["conf"]?.stringValue,
-                           "[\(flavor)] .conf 不一致")
+                           "[\(flavor)] .conf（带 Proxy Group）不一致")
+
+            // singbox 的配置按结构比（键顺序不影响客户端），链接按字节比
+            let configUrl = "http://\(host):8088/share/singbox"
+            XCTAssertEqual(ShareLinks.singboxLink(configUrl),
+                           value["singbox_link"]?.stringValue,
+                           "[\(flavor)] singbox deep link 不一致")
+
+            let ours = ShareLinks.singboxConfigJson(target)
+            let expected = value["singbox_config"]
+            if let oursDoc = Json.parse(ours), let expected {
+                // 逐段核对关键字段，避免依赖键顺序
+                XCTAssertEqual(oursDoc["outbounds"]?.arrayValue?.count,
+                               expected["outbounds"]?.arrayValue?.count,
+                               "[\(flavor)] singbox 出站数量不一致")
+                let ourProxy = oursDoc["outbounds"]?.arrayValue?.first
+                let expProxy = expected["outbounds"]?.arrayValue?.first
+                XCTAssertEqual(ourProxy?["type"]?.stringValue,
+                               expProxy?["type"]?.stringValue)
+                XCTAssertEqual(ourProxy?["server"]?.stringValue,
+                               expProxy?["server"]?.stringValue)
+                XCTAssertEqual(ourProxy?["server_port"]?.intValue,
+                               expProxy?["server_port"]?.intValue)
+                XCTAssertEqual(oursDoc["route"]?["final"]?.stringValue,
+                               expected["route"]?["final"]?.stringValue)
+            } else {
+                XCTFail("[\(flavor)] singbox 配置解析失败")
+            }
         }
     }
 

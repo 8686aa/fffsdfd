@@ -138,20 +138,27 @@ final class TgcpVectorTests: XCTestCase {
         let bounds = partial["bounds"]?.arrayValue?.compactMap { $0.intValue } ?? []
         let expected = partial["counts"]?.arrayValue?.compactMap { $0.intValue } ?? []
 
+        // ⚠️ bounds 是「分段点」，第一个元素是起点（0），**没有**对应的计数；
+        // counts[i] 对应的是喂到 bounds[i+1] 之后的累计帧数。
+        // 之前直接用 enumerated() 的 index 去查 counts，整体错位一位 ——
+        // 结果在最后一段上断言 total==1 却拿到 counts[4] 的语义，稳定失败。
+        XCTAssertEqual(bounds.first ?? 0, 0, "bounds 应以 0 起始")
         let framer = Tgcp.Framer()
         var total = 0
         var previous = 0
-        for (index, bound) in bounds.enumerated() {
+        for (index, bound) in bounds.dropFirst().enumerated() {
             let upper = min(bound, packed.count)
             if upper <= previous { continue }
-            let chunk = Array(packed[previous..<upper])
+            total += try framer.feed(Array(packed[previous..<upper])).count
             previous = upper
-            total += try framer.feed(chunk).count
             if index < expected.count {
                 XCTAssertEqual(total, expected[index],
-                               "第 \(index) 段喂完后累计帧数不一致")
+                               "喂到第 \(index + 1) 段（累计 \(upper) 字节）后帧数不一致")
             }
         }
+        // 整段喂完必须切出 1 帧（53 字节 = 21 字节头 + 32 字节 body）
+        XCTAssertEqual(total, 1, "完整喂完后应切出 1 帧")
+        XCTAssertEqual(previous, packed.count, "应把全部字节都喂进去")
     }
 
     // ── DH 扩展头替换 ────────────────────────────────────────
