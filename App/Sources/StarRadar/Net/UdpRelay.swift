@@ -133,11 +133,17 @@ public final class UdpRelay {
         while running {
             var from = sockaddr_in()
             var fromLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+            // 容量必须在闭包外取：闭包内读 buffer.count 会与
+            // withUnsafeMutableBytes 的可变借用**重叠**，Swift 报
+            // "overlapping accesses to 'buffer', but modification requires
+            //  exclusive access"。同理 &from 与 &fromLength 也不能在
+            // 同一个闭包里同时取两个 inout。
+            let capacity = buffer.count
             let received = buffer.withUnsafeMutableBytes { raw -> Int in
                 guard let base = raw.baseAddress else { return -1 }
                 return withUnsafeMutablePointer(to: &from) { pointer in
                     pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        recvfrom(fd, base, buffer.count, 0, $0, &fromLength)
+                        recvfrom(fd, base, capacity, 0, $0, &fromLength)
                     }
                 }
             }
@@ -259,10 +265,11 @@ public final class UdpRelay {
         guard parts.count == 2, let targetPort = Int(parts[1]) else { return }
         let targetIp = String(parts[0])
 
+        let capacity = buffer.count
         while running {
             let received = buffer.withUnsafeMutableBytes { raw -> Int in
                 guard let base = raw.baseAddress else { return -1 }
-                return Darwin.recv(handle, base, buffer.count, 0)
+                return Darwin.recv(handle, base, capacity, 0)
             }
             if received <= 0 {
                 if received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
