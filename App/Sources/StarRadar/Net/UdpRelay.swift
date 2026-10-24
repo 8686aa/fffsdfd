@@ -215,13 +215,18 @@ public final class UdpRelay {
             lock.lock(); packetsIn += 1; lock.unlock()
 
             let data = Array(buffer[0..<received])
-            guard let parsed = Socks5Proto.parseUdp(data), parsed.port != 0 else {
-                lock.lock()
-                if parsed == nil { droppedParse += 1 } else { droppedPortZero += 1 }
-                lock.unlock()
+            // 先解析再分别判断：`guard let ... else` 的 else 分支里 `parsed`
+            // 还没被绑定，写 `parsed == nil` 编译不过（cannot find in scope）。
+            guard let parsed = Socks5Proto.parseUdp(data) else {
+                lock.lock(); droppedParse += 1; lock.unlock()
                 note("UDP 报文解析失败（\(received) 字节，首 4 字节 "
                      + "\(data.prefix(4).map { String(format: "%02x", $0) }.joined(separator: " "))）",
                      kind: "parse")
+                continue
+            }
+            guard parsed.port != 0 else {
+                lock.lock(); droppedPortZero += 1; lock.unlock()
+                note("UDP 目标端口为 0（目标 \(parsed.host)），无法转发", kind: "port-zero")
                 continue
             }
 
@@ -440,11 +445,10 @@ public final class UdpRelay {
             return cached
         }
         lock.unlock()
-        // HostResolver.ipv4 返回 String?，`try?` 会把它 flatten 成 String?，
-        // 所以只需要解一层。
-        guard let value = try? HostResolver.ipv4(host), let ip = value else {
-            return nil
-        }
+        // HostResolver.ipv4 是 `throws -> String?`，`try?` 在 Swift 5 里会把
+        // 双层可选 flatten 成单层 String? —— 所以只能解一层，写
+        // `guard let a = try? ..., let b = a` 会报 "must have Optional type"。
+        guard let ip = try? HostResolver.ipv4(host) else { return nil }
         lock.lock()
         if dnsCache.count > 128 { dnsCache.removeAll() }
         dnsCache[host] = ip
