@@ -30,20 +30,35 @@ jobs:
   ipa:
     name: unsigned ipa
     needs: core-tests
-    runs-on: macos-14
+    # ⚠️ 必须用 Xcode 16+（macos-15）。XcodeGen 生成的是 objectVersion 77，
+    # 而 macos-14 上是 Xcode 15.4，只能读到 60：
+    #   "The project ... cannot be opened because it is in a future
+    #    Xcode project file format (77)"
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
+      - name: show Xcode versions
+        run: |
+          ls /Applications | grep -i '^Xcode' || true
+          xcodebuild -version
+
       - name: select Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode.app
+          # 选已安装的最新一份（runner 上通常有多个版本并存）
+          LATEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "using $LATEST"
+          sudo xcode-select -s "$LATEST"
           xcodebuild -version
 
       - name: install xcodegen
         run: brew install xcodegen
 
       - name: generate project
-        run: xcodegen generate
+        run: |
+          xcodegen generate
+          echo "--- objectVersion ---"
+          grep -m1 objectVersion StarRadar.xcodeproj/project.pbxproj || true
 
       - name: build (no signing)
         run: |
