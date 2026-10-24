@@ -106,8 +106,10 @@ final class SecureWsVectorTests: XCTestCase {
         let secondDoc = Json.parse(secondText)!
         XCTAssertEqual(secondDoc["seq"]?.intValue, second["seq"]?.intValue,
                        "seq 必须自增到 2")
-        XCTAssertFalse(second["d"]?.stringValue.isEmpty ?? true,
-                       "向量里的 second.d 不该为空")
+        // 注意写法：`second["d"]?.stringValue` 已经是 String?，
+        // 再接 `.isEmpty` 会被编译器判为「可选值没解包」。
+        let secondCipher = second["d"]?.stringValue ?? ""
+        XCTAssertFalse(secondCipher.isEmpty, "向量里的 second.d 不该为空")
     }
 
     func testDecryptsServerFrameFromPython() throws {
