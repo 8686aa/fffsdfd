@@ -180,16 +180,16 @@ PC 版 evidence 里所有 `ch-*.bin` 的 layer 字段都是 `lz4`，**没有一�
 
 ### 已经在 CI 上跑通的（就是证据，不是预计）
 
-Run #40086825246：
+Run [#40890505575](https://github.com/8686aa/fffsdfd/actions/runs/40890505575)（1.0.6）：
 
 ```
-Core vector tests   success      ← 与 PC/Android 共用同一批向量
+Core vector tests   success   ← 61 个测试、0 失败（含新增 Lz4Tests 5 + TgcpJoinTests 5）
 unsigned ipa        success
   show Xcode versions / select Xcode / install xcodegen / generate project
   build (no signing) / package ipa / upload artifact   ← 全部 ok
 ```
 
-产物 `StarRadar-unsigned.ipa`（434 KB artifact，解包后 448 KB）：
+产物 `StarRadar-unsigned.ipa`（487 KB artifact，解包后 480 KB）：
 
 | 检查 | 结果 |
 |---|---|
@@ -200,7 +200,7 @@ unsigned ipa        success
 | 后台模式 | `audio` |
 | 局域网授权描述 | 有 |
 | ATS | `NSAllowsArbitraryLoads = true` |
-| 可执行文件 | 1.53 MB，arm64 单架构，`MH_MAGIC_64` |
+| 可执行文件 | 1.64 MB，arm64 单架构，`MH_MAGIC_64` |
 | 平台 / 最低系统 | iOS / 15.0（SDK 26.2） |
 | 签名 | **无** `_CodeSignature`、无 `embedded.mobileprovision` |
 
@@ -208,7 +208,7 @@ unsigned ipa        success
 
 ```bash
 python3 tools/verify_ipa.py artifacts/StarRadar-unsigned.ipa
-# 22 项通过，0 项失败
+# 24 项通过，0 项失败
 ```
 
 ### 还没验证的（必须真机）
