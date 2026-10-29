@@ -42,6 +42,89 @@ public enum Tgcp {
     public static let lz4Limit = 4194304
     public static let contextRadius = 2048
 
+    /**
+     「入局」消息名 —— 见到就**无视抽样、无视预算**地扫这一帧。
+
+     ## 为什么必须有这一条（PC 版线上踩出来的坑）
+
+     旧的假设是「同一连接里密钥不会变」：采到一份母料之后只按索引抽样扫，
+     且扫描次数一超预算就永久停扫。实测这个假设是错的 —— 游戏**不在局间
+     重连**，一个 TCP 连接连着跨好几局，母料却逐局都换。
+
+     PC 版 18:10 的现场：连接 94 在 18:10:53.959 收到第二局的
+     `CSPlayerJoinMatchNtf`，当时 scan_frames 恰好不是抽样间隔的整数倍，
+     于是被直接跳过，那一局母料永远丢了，节点还拿着上一局的钥 ——
+     用户看到的就是「第一盘正常、第二盘不上报」。
+
+     入局通知一局只有一条，按消息名精确命中，成本可以忽略。
+
+     ⚠️ 这段与 `starradar-pc/core/tgcp.py` 的 `JOIN_MESSAGES` **必须同值**。
+     差一个字节就会一边采得到、一边采不到，而现象完全一样（都是「没上报」）。
+     */
+    public static let joinMessages: [[UInt8]] = [
+        Array("CSPlayerJoinMatchNtf".utf8),
+        Array("CSMatchRoomReconnectRes".utf8),
+    ]
+
+    /// 这一帧明文里有没有入局消息名。
+    public static func mentionsJoin(_ plain: [UInt8]) -> Bool {
+        for name in joinMessages where !name.isEmpty {
+            if plain.count < name.count { continue }
+            if _contains(plain, name) { return true }
+        }
+        return false
+    }
+
+    /// 朴素子串查找。名字都很短、出现位置也靠前，不用上 KMP。
+    private static func _contains(_ haystack: [UInt8], _ needle: [UInt8]) -> Bool {
+        let limit = haystack.count - needle.count
+        if limit < 0 { return false }
+        let first = needle[0]
+        var index = 0
+        while index <= limit {
+            if haystack[index] == first {
+                var matched = true
+                var k = 1
+                while k < needle.count {
+                    if haystack[index + k] != needle[k] {
+                        matched = false
+                        break
+                    }
+                    k += 1
+                }
+                if matched { return true }
+            }
+            index += 1
+        }
+        return false
+    }
+
+    /**
+     试着把一段明文按 LZ4 解压。
+
+     与 PC 版 `maybe_decompress_lz4` 语义一致：解不开返回 nil，调用方
+     当「这层不存在」处理。**不要**把失败当错误抛出 —— 大部分帧本来就
+     没压缩，解压失败是最常见的情况。
+     */
+    public static func maybeDecompressLz4(_ data: [UInt8]) -> [UInt8]? {
+        if data.isEmpty || data.count > maxInspect { return nil }
+        guard let expanded = Lz4.tryDecompress(data) else { return nil }
+        // 解出来和原文一样，说明这段字节恰好是个「什么都不做」的块，
+        // 对扫描没有增量信息，别当成新的一层（避免同一帧扫两遍）。
+        if expanded == data { return nil }
+        return expanded
+    }
+
+    /// 扩展头的第一个字节 = 压缩方法。非 0 即压缩（0 = 原样）。
+    ///
+    /// 返回 0 表示没有扩展头 —— 这时压缩位**不存在**，不能默认「没压缩」
+    /// 也再去试一次 LZ4：试一次要扫一遍字节，而绝大多数帧都没压。
+    public static func compressionMethod(_ rawHeader: [UInt8]) -> Int {
+        guard rawHeader.count > fixedHeader else { return 0 }
+        return Int(rawHeader[fixedHeader])
+    }
+
+
     /// 母料 128 字节。base64 后 172 字符且必带 '='。
     public static let materialSize = 128
 

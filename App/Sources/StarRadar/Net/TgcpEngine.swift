@@ -40,7 +40,16 @@ public final class TgcpEngine {
 
     public static let pendingMaxFrames = 64
     public static let pendingMaxBytes = 256 * 1024
+
+    /// 已采到母料后，业务帧的抽样间隔（每 N 帧才全文扫一次）。
+    ///
+    /// PC 版是 200，iOS 用 16 —— 手机 CPU 比路由器强得多，而漏一帧的代价
+    /// 是整局没钥。两边都还有「入局帧无条件扫」兜底，所以这个值只影响
+    /// 「同一局内新出现的母料」这条少见路径。
     public static let rescanEvery = 16
+
+    /// 还没采到任何母料时的扫描预算（业务帧计数）。超了就停扫 ——
+    /// 只在「连接活着但永远没有母料」时生效，避免白烧 CPU。
     public static let scanBudget = 200_000
 
     private struct Emit {
@@ -73,6 +82,12 @@ public final class TgcpEngine {
 
     private var seenMaterials = Set<String>()
     private var scanFrames = 0
+    /// 解压成功 / 失败的业务帧数。状态页要能看出「这台机器上的帧到底压没压」——
+    /// 采不到母料时第一个要排除的就是「压缩位没认出来」。
+    private var lz4Frames = 0
+    private var lz4Failed = 0
+    /// 最后一份母料来自哪一层（"plain" / "lz4"）。
+    private var lastMaterialLayer = ""
 
     /// 最近的帧轨迹（环形，最多 `traceKeep` 条）。
     ///
@@ -356,22 +371,68 @@ public final class TgcpEngine {
                               _ plain: [UInt8]) {
         if direction != .s2c || frame.command != Tgcp.cmdBattleS2C { return }
 
+        // 0x4013 是**常规业务帧**（实测一局出现 679 次），不是只在登录时
+        // 下发一次。所以这里每一步都要能省则省，否则每帧几毫秒地累，
+        // 进游戏就是明显卡顿。
         scanFrames += 1
-        // 已经捞到过母料：同一连接里密钥不会变，只抽查（防长连接跨两局换钥）
-        if !seenMaterials.isEmpty && scanFrames % TgcpEngine.rescanEvery != 0 {
-            return
-        }
-        if scanFrames > TgcpEngine.scanBudget { return }
 
+        // ── 明文层 + 可选的 LZ4 层 ─────────────────────────────
+        //
+        // 压缩位在扩展头第一个字节：非 0 表示 body 是整块 LZ4。
+        // 只在真的标了压缩时才试 —— 解压要扫一遍字节，而绝大多数帧没压。
+        var layers: [(data: [UInt8], name: String)] = [(data: plain, name: "plain")]
+        if Tgcp.compressionMethod(frame.rawHeader) != 0 {
+            if let expanded = Tgcp.maybeDecompressLz4(plain) {
+                layers.append((data: expanded, name: "lz4"))
+                lz4Frames += 1
+            } else {
+                lz4Failed += 1
+            }
+        }
+
+        // ── 入局帧无条件扫，不受抽样 / 预算限制 ────────────────
+        //
+        // 见 `Tgcp.joinMessages` 的说明：游戏不在局间重连，一个连接跨好几局，
+        // 母料却逐局都换。旧逻辑按索引抽样，第二盘的入局帧被跳过 → 那一局
+        // 母料永远丢失，用户看到「第二盘不上报」。
+        var joined = false
+        for layer in layers where Tgcp.mentionsJoin(layer.data) {
+            joined = true
+            break
+        }
+
+        if !joined {
+            if !seenMaterials.isEmpty {
+                // 已经捞到过母料：同一连接里密钥通常不会变，只抽查。
+                // （保留抽样是为了「一帧里有多个母料」和「局内换钥」这两种
+                //  少见但出现过的情况 —— 入局帧那条路已经兜住了。）
+                if scanFrames % TgcpEngine.rescanEvery != 0 { return }
+            } else if scanFrames > TgcpEngine.scanBudget {
+                // 还没捞到就超预算：停扫。这一条只在「连接活着但永远没有
+                // 母料」时生效（比如连的是别的服），避免白烧 CPU。
+                return
+            }
+        } else {
+            log("[ch] 入局帧（第 \(scanFrames) 个业务帧），这一帧必扫")
+        }
+
+        for layer in layers {
+            scanLayer(direction, frame, layer.data, layer.name)
+        }
+    }
+
+    /// 在一层数据里找 128 字节母料。抽出来是因为现在有 plain / lz4 两层。
+    private func scanLayer(_ direction: Direction, _ frame: Tgcp.Frame,
+                           _ data: [UInt8], _ layer: String) {
         // 母料 128 字节 base64 后必带 '='。没有 '=' 的明文不可能命中，
         // 直接跳过全文扫描 —— 这条能省掉 99% 的成本。
-        if !plain.contains(UInt8(ascii: "=")) { return }
+        if !data.contains(UInt8(ascii: "=")) { return }
 
         var index = 0
-        while index < plain.count {
-            guard let run = findBase64Run(plain, index) else { break }
+        while index < data.count {
+            guard let run = findBase64Run(data, index) else { break }
             index = run.end
-            let token = Array(plain[run.start..<run.end])
+            let token = Array(data[run.start..<run.end])
             guard let decoded = Data(base64Encoded: Data(token)) else { continue }
             if decoded.count != Tgcp.materialSize { continue }
             let bytes = [UInt8](decoded)
@@ -382,6 +443,7 @@ public final class TgcpEngine {
             materials = seenMaterials.count
             log("[ch] 参数已更新")
             let upstream = sessionInfo()
+            lastMaterialLayer = layer
             onKey(KeyMaterial(material: bytes, session: upstream.0,
                               upstream: upstream, sha256: sha,
                               command: frame.command,
@@ -447,6 +509,10 @@ public final class TgcpEngine {
             "bytesS2c": bytesS2c,
             "translated": translatedBody,
             "materials": materials,
+            "scanFrames": scanFrames,
+            "lz4Frames": lz4Frames,
+            "lz4Failed": lz4Failed,
+            "materialLayer": lastMaterialLayer,
             "pending": pending.count,
             "error": lastError,
             "trace": trace,

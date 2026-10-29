@@ -104,6 +104,52 @@ TrollStore 等）安装；企业签名/自签证书的流程不在本仓库范�
 
 ---
 
+## 与 PC 版对齐：母料采集的两处关键修正（1.0.6）
+
+PC 版用线上问题换来的两条结论，这一版搬到了 iOS。它们**只影响能不能采到
+母料**，不影响连接是否正常 —— 错了不崩、不报错，只是那一局不上报。
+
+### 1. 入局帧无条件扫（修「第二盘不上报」）
+
+旧逻辑：采到第一份母料后，业务帧按 `scanFrames % 16` 抽样；没采到之前
+也照样抽样。
+
+错在哪：游戏**不在局间重连**，一个 TCP 连接连着跨好几局，而母料逐局都换。
+第二盘的入局帧如果恰好落在抽样空档里，就被跳过，那一局母料永远丢失。
+
+PC 版 18:10 的现场：连接 94 在 18:10:53.959 收到第二局的
+`CSPlayerJoinMatchNtf`，当时 `scan_frames = 736`，`736 % 200 ≠ 0`，
+于是直接跳过 —— 用户看到的就是「第一盘正常、第二盘没数据」。
+
+现在：`Tgcp.joinMessages` 里两个消息名（`CSPlayerJoinMatchNtf` /
+`CSMatchRoomReconnectRes`）一出现，**无视抽样、无视预算**扫这一帧。
+入局通知一局只有一条，成本可以忽略。
+
+### 2. 按压缩位解 LZ4（母料在压缩层里）
+
+`0x4013` 的明文经常是整块 LZ4 压缩的（扩展头第一个字节 = 压缩方法，非 0
+即压缩）。不解压时「有时候能采到」—— 128 字节随机母料在 LZ4 里必然作为
+literal 原样保留，但**紧跟其后的控制字节**可能落进 base64 字符集，把
+run 算长、或让负向断言判失败，长度对不上就丢候选。
+
+PC 版 evidence 里所有 `ch-*.bin` 的 layer 字段都是 `lz4`，**没有一条**
+来自 plain 层。所以解压不是「多一条路」，是唯一稳的那条。
+
+实现在 `Core/Sources/StarRadarCore/Lz4.swift`（纯 Swift，无第三方依赖），
+与 PC 的 `core/lz4.py`、Android 的 `Lz4.kt` 逐行对应，交叉验证向量由 PC
+参考实现生成（`tools/gen_lz4_vectors.py` → `Vectors/lz4_vectors.json`，
+覆盖空输入 / 长短 literal / RLE / 重叠 match / 长 match / 真实母料形状 /
+三条非法输入）。
+
+### 顺带对齐的
+
+- 状态页多了几个数：`scanFrames` / `lz4Frames` / `lz4Failed` / `materialLayer`
+  —— 采不到母料时，第一个要排除的就是「压缩位没认出来」。
+- 采样策略的语义与 PC 一致：**没采到母料时每帧都扫**（直到预算），
+  采到之后才抽样。原来的写法是「不管有没有都抽样」，会在开局阶段漏帧。
+
+---
+
 ## 使用流程
 
 1. 本机连上 Wi-Fi（或开热点让另一台设备连过来）
@@ -150,7 +196,7 @@ unsigned ipa        success
 | 结构 | `Payload/StarRadar.app/`，无多余层级 |
 | 显示名 | `APP` |
 | bundle id | `com.starradar.ios`（`$(...)` 已展开） |
-| 版本 | 1.0.0 (1) |
+| 版本 | 1.0.6 (6) |
 | 后台模式 | `audio` |
 | 局域网授权描述 | 有 |
 | ATS | `NSAllowsArbitraryLoads = true` |
@@ -186,6 +232,8 @@ python3 tools/verify_ipa.py artifacts/StarRadar-unsigned.ipa
 | 4 | 测试崩 `unexpectedly found nil` | `envelope.firstPlaintext_utf8` 与 `first` **同级**，被当成子键 | 改取值路径 |
 | 5 | `Unable to read project ... format (77)` | XcodeGen 出 objectVersion 77，macos-14 是 Xcode 15.4（只到 60） | ipa job 换 `macos-15` |
 | 6 | `overlapping accesses to 'buffer'` | `withUnsafeMutableBytes` 闭包里读了 `buffer.count` | 容量在闭包外取好 |
+| 7 | 母料「第一盘有、第二盘没有」 | 业务帧按索引抽样，入局帧被跳过 | `joinMessages` 命中就无视抽样/预算（见上一节） |
+| 8 | 采到的 layer 全是 plain、真机偶发丢 | 没解 LZ4，母料后的控制字节污染 base64 边界 | 按扩展头压缩位解压，两层都扫 |
 
 另外两个不是「编译错误」但更值得记的：
 
