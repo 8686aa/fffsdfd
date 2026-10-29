@@ -196,7 +196,7 @@ unsigned ipa        success
 | 结构 | `Payload/StarRadar.app/`，无多余层级 |
 | 显示名 | `APP` |
 | bundle id | `com.starradar.ios`（`$(...)` 已展开） |
-| 版本 | 1.0.6 (6) |
+| 版本 | 1.0.6（CI 把 build 号覆盖成 `run_number`，本次 16） |
 | 后台模式 | `audio` |
 | 局域网授权描述 | 有 |
 | ATS | `NSAllowsArbitraryLoads = true` |
