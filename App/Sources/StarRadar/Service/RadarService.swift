@@ -474,6 +474,27 @@ final class RadarService: ObservableObject {
         )
         uploader?.setKey(key)
         appendLog("[ch] 已获取对局参数（\(material.id)）")
+
+        // ── 采到即断（与 PC 的 close_after_material 一致）────────────
+        //
+        // 换过钥的那条连接如果继续跑下去，后面的 ACE 数据就一直走在
+        // 中间人通道上（公钥已经暴露，但没必要继续暴露）。断掉它，
+        // 客户端 1~2 秒重连到一条纯转发的新连接。
+        //
+        // 延迟 0.5 秒而不是立刻：母料是在处理帧的调用栈里发现的，
+        // 立刻断会把这条连接上还没走完的收尾（比如刚排队的入局帧）
+        // 一起掐掉。PC 版实测 0.5 秒够用。
+        //
+        // 断开发生在「刚入局」那一刻，客户端会闪断一下 —— 这是这个
+        // 策略的已知代价（换来的是整局纯转发）。
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self else { return }
+            let n = self.server?.dropAllConnections() ?? 0
+            guard n > 0 else { return }
+            DispatchQueue.main.async {
+                self.appendLog("[ch] 已采到母料，断开 \(n) 条连接（后续走直通）")
+            }
+        }
     }
 
     /// 挂起超过这个秒数才清理旧连接。低于它认为连接还活着（内核在挂起期间
