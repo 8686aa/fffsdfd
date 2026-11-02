@@ -62,7 +62,7 @@ struct HomeView: View {
             service.refreshStats()
         }) {
             if let url = URL(string: webUrl) {
-                BuiltinWebScreen(url: url)
+                BuiltinWebScreen(url: url, service: service)
             } else {
                 VStack(spacing: 10) {
                     Text("地址无效").foregroundColor(Sr.err)
@@ -168,8 +168,37 @@ struct HomeView: View {
                                 enabled: !probing && service.problems.isEmpty) {
                     runProbe()
                 }
+                // 「重新采集」：与 PC / 安卓同一个用法 —— 开局前点一次。
+                // 采到母料会自动撤防，之后整局纯转发（零换钥、零额外暴露）。
+                SecondaryButton(
+                    title: service.rekeyArmed ? "重采 ✓" : "重新采集",
+                    enabled: service.running
+                ) {
+                    service.rekeyNow()
+                }
             }
             .padding(.top, 12)
+
+            // 换钥状态 + 阶段，两行小字。判据见 RekeyGate（对局流速 → 活跃连接）。
+            Text(service.rekeyArmed
+                 ? "采集窗口：已打开（换钥 \(service.rekeyOpened) 次 · 跳过 \(service.rekeySkipped) 次）· 采到母料会自动关闭"
+                 : "换钥：未启用（已换 \(service.rekeyOpened) 次）· 点「重新采集」才开始，采到后自动关")
+                .font(.system(size: 11))
+                .foregroundColor(service.rekeyArmed ? Sr.accent : Sr.dim)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 6)
+
+            Text({
+                switch service.phase {
+                case "battle": return "阶段：对局中"
+                case "lobby": return "阶段：大厅等待"
+                default: return "阶段：未连接"
+                }
+            }())
+                .font(.system(size: 11))
+                .foregroundColor(service.phase == "battle" ? Sr.accent : Sr.dim)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 2)
 
             // 内置网页要点开节点上的页面，节点只认「已连上上报」的口令，
             // 所以这里必须等上报真的 connected。

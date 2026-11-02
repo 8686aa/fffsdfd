@@ -27,16 +27,27 @@ import StarRadarCore
 struct BuiltinWebScreen: View {
 
     let url: URL
+    /// 「重新采集」要落到同一个 RadarService 上（与主界面按钮等价）。
+    @ObservedObject var service: RadarService
     @Environment(\.dismiss) private var dismiss
 
     @State private var progress: Double = 0
     @State private var failure: String?
+
+    /// 重采气泡的拖动偏移（相对初始位置「右侧中部」）。
+    /// 记住它是为了不要每次进页面都回到同一个可能挡住数据的角落。
+    @State private var bubbleOffset: CGSize = .zero
+    /// 拖动中的临时偏移。
+    @State private var dragStart: CGSize?
+    /// 点击后的短暂反馈文字。
+    @State private var bubbleText = "钥"
 
     var body: some View {
         GeometryReader { geometry in
             // 宽大于高即横屏。用尺寸判断而不是 sizeClass：iPhone 横屏时
             // compact/regular 的组合依机型而变，判断不可靠。
             let isLandscape = geometry.size.width > geometry.size.height
+            let bubbleSize: CGFloat = 46
 
             ZStack(alignment: .topLeading) {
                 Sr.bg.ignoresSafeArea()
@@ -49,6 +60,9 @@ struct BuiltinWebScreen: View {
                 progressBar(isLandscape: isLandscape)
 
                 backBubble(isLandscape: isLandscape)
+
+                // 右侧中部的「重采」气泡：可拖动，松手停住，轻点触发。
+                rekeyBubble(size: bubbleSize, in: geometry.size)
 
                 if let failure {
                     errorOverlay(failure)
@@ -69,6 +83,57 @@ struct BuiltinWebScreen: View {
             OrientationLock.portrait()
             OrientationLock.apply()
         }
+    }
+
+    /**
+     右侧中部的悬浮「重采」气泡。
+
+     为什么放在网页里：用户在这个页面看对局数据，一旦发现「数据不动了」
+     就要立刻重采 —— 退回主界面再点，回来页面已经重载了。
+
+     可拖动：不同页面被挡住的关键数字位置不一样，固定位置迟早挡到东西。
+     */
+    private func rekeyBubble(size: CGFloat, in canvas: CGSize) -> some View {
+        let armedColor = Sr.accent
+        let baseX = canvas.width - size / 2 - 14
+        let baseY = canvas.height / 2
+        let current = CGSize(
+            width: baseX + bubbleOffset.width,
+            height: baseY + bubbleOffset.height
+        )
+
+        return Text(bubbleText)
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundColor(.white)
+            .frame(width: size, height: size)
+            .background(Circle().fill(armedColor))
+            .shadow(color: .black.opacity(0.25), radius: 6, y: 2)
+            .position(
+                x: min(max(current.width, size / 2), canvas.width - size / 2),
+                y: min(max(current.height, size / 2), canvas.height - size / 2)
+            )
+            .gesture(
+                DragGesture()
+                    .onChanged { value in
+                        if dragStart == nil { dragStart = bubbleOffset }
+                        let start = dragStart ?? .zero
+                        bubbleOffset = CGSize(
+                            width: start.width + value.translation.width,
+                            height: start.height + value.translation.height
+                        )
+                    }
+                    .onEnded { _ in
+                        dragStart = nil
+                    }
+            )
+            .onTapGesture {
+                let dropped = service.rekeyNow()
+                bubbleText = dropped > 0 ? "已断" : "已开"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                    bubbleText = "钥"
+                }
+            }
+            .accessibilityLabel("重新采集")
     }
 
     /// 顶部细进度条（加载中是唯一需要看到的状态）。

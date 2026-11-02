@@ -48,6 +48,22 @@ final class RadarService: ObservableObject {
     @Published var workers = 0
     @Published var queuedTasks = 0
 
+    /// 换钥总闸（与 PC / 安卓同一套语义，见 `RekeyGate`）。
+    ///
+    /// **初始不武装**：启动后对 65010 一律纯转发，只有用户点
+    /// 「重新采集」才打开闸门去换钥。采到母料会自动关回去 ——
+    /// 所以平时（不点）是零换钥、零额外暴露。
+    let rekeyGate = RekeyGate(armed: false)
+
+    // 界面用的镜像值。**必须是 @Published**：`rekeyGate` 是普通类，
+    // 直接读它的属性不会触发 SwiftUI 重绘。这几个值在 `refreshStats()`
+    // （0.5 秒一次）里同步，改闸门状态后最多半秒界面就跟上。
+    @Published var rekeyArmed = false
+    @Published var rekeyOpened = 0
+    @Published var rekeySkipped = 0
+    /// battle / lobby / idle，判据见 `RekeyGate.phase`。
+    @Published var phase = "idle"
+
     // 上报
     @Published var uplinkState = Uploader.stateStopped
     @Published var uplinkQueued = 0
@@ -284,7 +300,8 @@ final class RadarService: ObservableObject {
             },
             advertiseIp: { [weak self] in self?.lanIp ?? "0.0.0.0" },
             user: authUser, password: authPassword,
-            log: { [weak self] text in self?.appendLog(text) }
+            log: { [weak self] text in self?.appendLog(text) },
+            rekeyGate: rekeyGate
         )
         guard socks.start() else {
             errorText = socks.error
@@ -350,6 +367,55 @@ final class RadarService: ObservableObject {
 
     // ── 数据回填 ──────────────────────────────────────────────
 
+    /**
+     最近的 UDP 到达时刻（毫秒），只用来判「现在是不是在对局」。
+
+     为什么不用「解出明文里的入局通知」：那要先换钥，而换钥又要靠这个
+     信号放行 —— 会形成自锁（PC 版踩过）。UDP 流速不需要解密。
+     */
+    private var udpStamps: [Int64] = []
+    private var lastBattleProbeAt: Int64 = 0
+
+    private func noteBattleRate() {
+        let now = RekeyGate.nowMs()
+        udpStamps.append(now)
+        while let first = udpStamps.first, now - first > 3_000 {
+            udpStamps.removeFirst()
+        }
+        if udpStamps.count > 2048 {
+            udpStamps.removeFirst(udpStamps.count - 2048)
+        }
+        if now - lastBattleProbeAt < 2_000 { return }
+        lastBattleProbeAt = now
+        // 3 秒 ≥15 包 ≈ 5 包/秒 —— 与 PC 版 battle_active 的 min_rate 同档。
+        // 大厅的 DNS/心跳 < 1 包/秒，对局 20~60 包/秒，分得很开。
+        if udpStamps.count >= 15 {
+            rekeyGate.noteBattleActive(now: now)
+        }
+    }
+
+    /**
+     「重新采集」：打开闸门 + 清零节流 + **断开当前连接**，让客户端重连。
+
+     只开闸门不够 —— 客户端复用旧连接时，那条连接早就过了「要不要翻译」
+     的时刻（PC 版 `served=0` 时点按钮空转是同一类问题）。
+
+     - Returns: 断开的连接数
+     */
+    @discardableResult
+    func rekeyNow() -> Int {
+        rekeyGate.reset()
+        let dropped = server?.dropAllConnections() ?? 0
+        appendLog(dropped > 0
+            ? "[ch] 已重新打开采集窗口，断开 \(dropped) 条连接，等重连换钥"
+            : "[ch] 已重新打开采集窗口（当前没有连接，等下一条）")
+        // 立刻同步一次界面，不用等下一个 0.5 秒 tick
+        rekeyArmed = rekeyGate.armed
+        rekeyOpened = rekeyGate.opened
+        rekeySkipped = rekeyGate.skipped
+        return dropped
+    }
+
     private func handleUdp(_ srcIp: String, _ srcPort: Int, _ dstIp: String,
                            _ dstPort: Int, _ payload: [UInt8], _ up: Bool) {
         // 必须先规范化方向：下行包的 src 是服务器、dst 是客户端内网地址，
@@ -362,6 +428,10 @@ final class RadarService: ObservableObject {
             serverIp: flow.serverIp, serverPort: flow.serverPort,
             up: flow.up, payload: payload))
         if ready.isEmpty { return }
+
+        // 有包真的过闸了 → 顺手判一次「对局有没有在打」。
+        // 只更新闸门的 battleSeenAt，不参与上报逻辑。
+        noteBattleRate()
 
         statLock.lock()
         if up {
@@ -385,6 +455,9 @@ final class RadarService: ObservableObject {
     }
 
     private func handleKey(_ material: KeyMaterial) {
+        // 母料到手 → 撤防：这一局剩下的连接一律纯转发，不再换公钥。
+        // 要再采就点「重新采集」（UI 调 rekeyGate.reset()）。
+        rekeyGate.noteMaterial()
         DispatchQueue.main.async { [weak self] in
             self?.keysFound += 1
         }
@@ -461,6 +534,13 @@ final class RadarService: ObservableObject {
             filterSummary = "UDP 过滤：放行 \(filter.passed) 包 / 挡下 \(filter.dropped) 包" +
                 "（省 \(String(format: "%.1f", filter.savedPct))%）"
         }
+
+        // 换钥闸门的镜像值：`rekeyGate` 是普通类，直接读不触发重绘，
+        // 所以在这里（0.5 秒一次、主线程）同步成 @Published。
+        rekeyArmed = rekeyGate.armed
+        rekeyOpened = rekeyGate.opened
+        rekeySkipped = rekeyGate.skipped
+        phase = rekeyGate.phase(hasActiveConnection: active > 0)
     }
 
     // ── 扫码接入 ──────────────────────────────────────────────

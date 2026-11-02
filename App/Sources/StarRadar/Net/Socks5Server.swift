@@ -60,6 +60,12 @@ public final class Socks5Server {
     private let password: String
     private let log: (String) -> Void
 
+    /// 换钥总闸（与 PC / 安卓版同一套语义，见 `RekeyGate`）。
+    ///
+    /// nil 表示不做治理、每条目标端口都翻译 —— 只有测试会这么用。
+    /// 生产路径一定带上：否则每条 65010 都换一次 DH 公钥。
+    private let rekeyGate: RekeyGate?
+
     private var listener: NetSocket?
     private var acceptThread: Thread?
     private var running = false
@@ -88,7 +94,8 @@ public final class Socks5Server {
                 onKey: @escaping (KeyMaterial) -> Void,
                 advertiseIp: @escaping () -> String,
                 user: String = "", password: String = "",
-                log: @escaping (String) -> Void = { _ in }) {
+                log: @escaping (String) -> Void = { _ in },
+                rekeyGate: RekeyGate? = nil) {
         self.port = port
         self.targetPorts = targetPorts
         self.onUdp = onUdp
@@ -97,9 +104,40 @@ public final class Socks5Server {
         self.user = user
         self.password = password
         self.log = log
+        self.rekeyGate = rekeyGate
     }
 
     // ── 生命周期 ──────────────────────────────────────────────
+
+    /**
+     断掉所有当前 TCP 连接（**不停止服务**），让客户端重连。
+
+     ## 为什么「重新采集」必须做这一步
+
+     只打开换钥闸门是不够的：客户端如果一直复用已经建好的连接，那条连接
+     早就过了「决定要不要翻译」的时刻，闸门开了也轮不到它 —— 现象就是
+     「点了重新采集，换钥次数不涨、母料还是采不到」。
+
+     断开之后客户端 1~2 秒就会重连，新连接必然过闸门。
+
+     - Returns: 断开的连接数（给日志用）
+     */
+    @discardableResult
+    public func dropAllConnections() -> Int {
+        lock.lock()
+        let snapshot = Array(clients.values)
+        let udpSnapshot = relays
+        relays.removeAll()
+        lock.unlock()
+
+        for socket in snapshot {
+            socket.close()
+        }
+        for relay in udpSnapshot {
+            relay.close()
+        }
+        return snapshot.count
+    }
 
     public func start() -> Bool {
         do {
@@ -308,7 +346,13 @@ public final class Socks5Server {
         }
 
         // 对局端口交给帧翻译通道；其余端口普通转发。
-        let isTarget = targetPorts.contains(dstPort)
+        // 目标端口还要过「换钥总闸」：没武装 / 间隔不够 / 冷却中 → 纯转发。
+        // 这一条是原来没有的（以前每条 65010 都翻译 = 每条都换 DH 公钥，
+        // 服务器做一次公钥一致性校验就能认出中间人）。
+        let isTargetPort = targetPorts.contains(dstPort)
+        let gateDecision: RekeyGate.Decision? = isTargetPort
+            ? rekeyGate?.allow() : nil
+        let isTarget = isTargetPort && (gateDecision?.allowed ?? true)
         let upstream: NetSocket
         do {
             upstream = try NetSocket.connect(host: dstIp, port: dstPort,
@@ -329,16 +373,26 @@ public final class Socks5Server {
                   upstream.localPort())
 
         connects += 1
-        if isTarget { log("[s5] 对局通道已建立（:\(dstPort)）") }
+        if isTarget {
+            log("[s5] 对局通道已建立（:\(dstPort)）")
+        } else if isTargetPort, let d = gateDecision {
+            log("[s5] 跳过换钥（\(d.reason)），:\(dstPort) 纯转发")
+        }
 
         defer { upstream.close() }
         client.setRecvTimeout(ms: 0)          // 长连接不再有握手超时
 
         if isTarget {
             channelTcp += 1
-            SocketTunnel(client: client, upstream: upstream,
-                         sessionInfo: { (dstIp, dstPort) },
-                         onKey: onKey, log: log).run()
+            SocketTunnel(
+                client: client, upstream: upstream,
+                sessionInfo: { (dstIp, dstPort) },
+                // 采到母料立刻撤防：这一局剩下的连接一律纯转发
+                onKey: { [rekeyGate] material in
+                    rekeyGate?.noteMaterial()
+                    onKey(material)
+                },
+                log: log).run()
         } else {
             plainTcp += 1
             plainPipe(client, upstream, dstPort)
