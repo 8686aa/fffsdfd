@@ -387,8 +387,10 @@ public final class Socks5Server {
             SocketTunnel(
                 client: client, upstream: upstream,
                 sessionInfo: { (dstIp, dstPort) },
-                // 采到母料立刻撤防：这一局剩下的连接一律纯转发
-                onKey: { [rekeyGate] material in
+                // 采到母料立刻撤防：这一局剩下的连接一律纯转发。
+                // 捕获列表里带上 `onKey` —— 它是 self 的属性，escaping
+                // 闭包里不能裸写（会报 "requires explicit use of 'self'"）。
+                onKey: { [rekeyGate, onKey] material in
                     rekeyGate?.noteMaterial()
                     onKey(material)
                 },

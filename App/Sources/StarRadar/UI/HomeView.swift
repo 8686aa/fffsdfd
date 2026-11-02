@@ -188,13 +188,8 @@ struct HomeView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 6)
 
-            Text({
-                switch service.phase {
-                case "battle": return "阶段：对局中"
-                case "lobby": return "阶段：大厅等待"
-                default: return "阶段：未连接"
-                }
-            }())
+            Text(service.phase == "battle" ? "阶段：对局中"
+                 : (service.phase == "lobby" ? "阶段：大厅等待" : "阶段：未连接"))
                 .font(.system(size: 11))
                 .foregroundColor(service.phase == "battle" ? Sr.accent : Sr.dim)
                 .frame(maxWidth: .infinity, alignment: .leading)
